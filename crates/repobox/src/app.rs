@@ -52,6 +52,7 @@ pub async fn run(cli: Cli, output: &Output) -> Result<()> {
             logs(
                 output,
                 &repository,
+                args.environment.environment.as_deref(),
                 args.service.as_deref(),
                 args.follow,
                 args.tail,
@@ -582,12 +583,13 @@ async fn status(output: &Output, repository: &Path, explicit: Option<&str>) -> R
 async fn logs(
     output: &Output,
     repository: &Path,
+    environment_name: Option<&str>,
     service: Option<&str>,
     follow: bool,
     tail: usize,
 ) -> Result<()> {
     let context = ProjectContext::load(repository)?;
-    let environment = context.environment(None).await?;
+    let environment = context.environment(environment_name).await?;
     let variables = available_runtime_variables(&context, &environment)?;
     let runtime = compose_runtime(&context, &environment, &BTreeMap::new()).await?;
     let child = runtime.spawn_logs(service, follow, tail)?;
@@ -1197,6 +1199,7 @@ async fn service(
             logs(
                 output,
                 repository,
+                None,
                 Some(&args.service),
                 args.follow,
                 args.tail,

@@ -27,6 +27,8 @@ All notable changes to Repobox will be documented here.
 
 ### Fixed
 
+- Honor the explicit `--environment` selector for top-level `logs` instead of
+  silently falling back to `REPOBOX_ENV` or the current Git branch.
 - Resume the explicitly requested create or pull job instead of selecting a
   newer operation for the same environment.
 - Preserve canonical role identity across pull, avoid rotating roles after

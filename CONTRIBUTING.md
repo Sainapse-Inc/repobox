@@ -37,13 +37,21 @@ Before a release, a maintainer must execute [the live provider smoke](docs/live-
 
 The release workflow expects:
 
-- `CARGO_REGISTRY_TOKEN` for crates.io;
-- `HOMEBREW_TAP_TOKEN` with access to `abhirupghosh/homebrew-tap`;
+- `CARGO_REGISTRY_TOKEN` from a verified crates.io account and authorized to
+  publish new crates;
+- `HOMEBREW_TAP_TOKEN` as a fine-grained GitHub token scoped only to
+  `abhirupghosh/homebrew-tap` with repository Contents read/write permission;
 - a protected, signed-off stable tag named exactly `v<workspace-version>`
   after the live smoke;
 - an explicit full commit SHA for every release, which the tag must resolve to;
 - a dated `## [<workspace-version>] - YYYY-MM-DD` changelog heading;
 - a tagged commit that is reachable from `origin/main`.
+
+The tap may be empty before the first release. Do not pre-create
+`Formula/repobox.rb`: after the canonical GitHub assets exist, the release
+workflow creates the formula, runs `brew style`, audit, install, and formula
+tests, then pushes it to the tap. Before tagging, verify the configured token
+can push to the tap; public read access alone is insufficient.
 
 Release only through a manual dispatch of the reviewed workflow on `main`. Given an existing
 release tag, use:

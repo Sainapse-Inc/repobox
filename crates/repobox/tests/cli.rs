@@ -221,6 +221,45 @@ fn detect_and_init_cover_every_postgres_service() {
 }
 
 #[test]
+fn logs_environment_flag_overrides_repobox_env() {
+    let repository = fake_repository();
+    isolated_command(repository.path())
+        .args([
+            "init",
+            "--organization",
+            "acme",
+            "--yes",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    isolated_command(repository.path())
+        .env("REPOBOX_ENV", "invalid environment")
+        .args(["logs", "app", "--json", "--no-input"])
+        .assert()
+        .code(2)
+        .stderr(predicate::str::contains("invalid_environment_name"));
+
+    isolated_command(repository.path())
+        .env("REPOBOX_ENV", "invalid environment")
+        .args([
+            "logs",
+            "app",
+            "--environment",
+            "smoke/e2e",
+            "--tail",
+            "1",
+            "--json",
+            "--no-input",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("\"event\":\"log\""));
+}
+
+#[test]
 fn environment_dry_run_needs_no_provider_credentials() {
     let repository = fake_repository();
     command(repository.path())
