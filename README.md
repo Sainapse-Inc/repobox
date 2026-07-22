@@ -35,14 +35,13 @@ Release archives will cover Linux and macOS on x86_64 and arm64 with SHA-256 che
 
 ## Quick start
 
-1. Create a PlanetScale service token with access to the organization and the PostgreSQL database, backup, branch, role, and cluster-size operations Repobox will use.
-2. Authenticate without placing the token value in argv:
+1. Authenticate with PlanetScale. Repobox opens a browser and shows a confirmation code; no token needs to be copied:
 
    ```sh
    repobox auth login
    ```
 
-3. Enter a repository and run:
+2. Enter a repository and run:
 
    ```sh
    cd your-repository
@@ -76,6 +75,8 @@ repobox config detect --json --no-input
 repobox status --json --no-input
 repobox run --detach --yes --json --no-input
 ```
+
+For unattended automation, set `PLANETSCALE_SERVICE_TOKEN_ID` and `PLANETSCALE_SERVICE_TOKEN`; Repobox detects them and skips browser login. An agent coordinating with a human can instead run `repobox auth login --json --no-input`, surface the emitted approval URL and code, and wait for the final `result` event.
 
 Immediate commands emit one JSON envelope. Provider create/pull/resume operations, `run`, and log streams emit JSONL through a final `result` event. Data goes to stdout; diagnostics and structured errors go to stderr. Mutations return `undo_command` or an explicit `undo_reason`.
 
@@ -112,8 +113,8 @@ Rust 1.97.1 is pinned by `rust-toolchain.toml`.
 
 ```sh
 cargo fmt --all -- --check
-cargo clippy --workspace --all-targets --all-features -- -D warnings
-cargo test --workspace
+cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+cargo test --workspace --all-targets --locked
 ```
 
 See [CONTRIBUTING.md](CONTRIBUTING.md) for schema and release checks.

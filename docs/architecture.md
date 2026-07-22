@@ -8,7 +8,7 @@ Repobox v0.1 is a local control plane. Application processes stay on the develop
 |---|---|
 | `repobox` | CLI grammar, orchestration, credential resolution, managed agent guides, TUI, and user output. |
 | `repobox-core` | Strict config, deterministic identity, provider/runtime traits, structured envelopes/errors, atomic state, durable jobs, paths, and redaction. |
-| `repobox-provider-planetscale` | Direct PlanetScale HTTPS adapter with service-token auth, retries, pagination, and typed database/backup/branch/role operations. |
+| `repobox-provider-planetscale` | Direct PlanetScale HTTPS adapter with OAuth device authorization, Bearer or service-token API auth, revocation, retries, pagination, and typed database/backup/branch/role operations. |
 | `repobox-runtime-compose` | Canonical Compose detection, PostgreSQL classification, transient project transformation, runtime control, status, and logs. |
 
 Dependency direction is inward: adapters depend on `repobox-core`; core has no dependency on a concrete provider, runtime, TUI, or CLI.
@@ -75,10 +75,10 @@ Source Compose and env files stay untouched. Credentials do not appear in a temp
 Provider credentials resolve in this order:
 
 1. `PLANETSCALE_SERVICE_TOKEN_ID` and `PLANETSCALE_SERVICE_TOKEN` together;
-2. persistent OS credential service;
+2. a browser OAuth access token or service token in the persistent OS credential service;
 3. an explicit permission-restricted file fallback under the user config directory.
 
-Database URLs use the same credential layer under project/environment/service-specific keys. Config, state, jobs, agent guides, dry-run plans, and normal logs contain identifiers but not passwords.
+Interactive login uses PlanetScale's OAuth device flow and sends the resulting access token as a Bearer credential. Existing stored v0.1 service-token records remain readable and are replaced with the tagged credential format on the next login, while unattended callers retain environment-first service-token authentication. Database URLs use the same credential layer under project/environment/service-specific keys. Config, state, jobs, agent guides, dry-run plans, and normal logs contain identifiers but not passwords.
 
 ## TUI kernel
 

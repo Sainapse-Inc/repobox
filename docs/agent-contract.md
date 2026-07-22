@@ -160,7 +160,7 @@ No ANSI reaches a non-TTY stream. JSON mode never emits ANSI.
 | 1 | runtime | Inspect error code and job state; retry only if suggested. |
 | 2 | usage | Fix arguments or approval/input contract; do not retry unchanged. |
 | 3 | not found | Discover resources/config first. |
-| 4 | authentication | Set both provider credential variables or run login. |
+| 4 | authentication | Run browser login or set both service-token variables. |
 | 5 | conflict | Treat existing/in-progress/destructive-state conflict explicitly. |
 | 6 | permission | Fix provider token grants; blind retries will not help. |
 
@@ -174,7 +174,15 @@ export PLANETSCALE_SERVICE_TOKEN='...'
 repobox auth status --json --no-input
 ```
 
-An interactive human may run `repobox auth login`; Repobox opens the provider token page and reads the token with echo disabled. Both variables must be set together. Database connection URLs are never returned by status or agent-context.
+An interactive human runs `repobox auth login`; Repobox opens PlanetScale's device-approval page, prints the confirmation code, polls for approval, validates the resulting Bearer access token, and stores it in the normal credential layer. `repobox auth logout` revokes a stored browser token before removing it locally.
+
+An agent that needs human approval can use:
+
+```sh
+repobox auth login --json --no-input
+```
+
+That command emits an `auth_pending` JSONL event containing `verification_url`, `user_code`, `browser_opened`, and `expires_in_seconds`, followed by a terminal `result` event after approval. It never reads stdin. If either service-token variable is present, service-token mode takes precedence and both variables must be non-empty. Database connection URLs and access tokens are never returned by status or agent-context.
 
 ## Jobs and recovery
 

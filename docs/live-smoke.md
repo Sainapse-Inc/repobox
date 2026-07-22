@@ -6,6 +6,7 @@ This checklist is the release gate for provider behavior. It creates billable re
 
 - Rust and Docker Compose as pinned by the repository.
 - A disposable Git repository with at least one Compose PostgreSQL service and one local application service.
+- A disposable OS user/profile for browser-login verification; login replaces any previously stored Repobox provider credential.
 - A PlanetScale service token authorized to list organizations and cluster sizes and to create/delete databases, backups, branches, and roles in the disposable organization.
 - These environment variables:
 
@@ -23,21 +24,27 @@ Do not put values in shell history, fixtures, issue text, logs, or `.env` files 
 
    ```sh
    cargo fmt --all -- --check
-   cargo clippy --workspace --all-targets --all-features -- -D warnings
-   cargo test --workspace
+   cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+   cargo test --workspace --all-targets --locked
    cargo build --release --locked
    ```
 
    Expected: every command exits zero.
 
-2. Verify authentication and discovery.
+2. Verify browser authentication, revocation, service-token automation, and discovery.
 
    ```sh
+   env -u PLANETSCALE_SERVICE_TOKEN_ID -u PLANETSCALE_SERVICE_TOKEN \
+     target/release/repobox auth login --no-browser
+   env -u PLANETSCALE_SERVICE_TOKEN_ID -u PLANETSCALE_SERVICE_TOKEN \
+     target/release/repobox auth status --json --no-input
+   env -u PLANETSCALE_SERVICE_TOKEN_ID -u PLANETSCALE_SERVICE_TOKEN \
+     target/release/repobox auth logout --yes --no-input --json
    target/release/repobox auth status --json --no-input
    target/release/repobox doctor --online --json --no-input
    ```
 
-   Expected: auth is configured and valid; the provider API check is true. `doctor` may still report missing project config until init.
+   Expected: browser login prints a PlanetScale approval URL/code, status reports `browser_oauth`, and logout reports `revoked: true`. The following status resolves the exported service token and reports `service_token`; the provider API check is true. `doctor` may still report missing project config until init.
 
 3. Preview repository initialization.
 
@@ -136,7 +143,7 @@ Never automate broad organization deletion from this runbook.
 
 - If failure occurs before `old_deleted`, inspect the job and safely resume forward.
 - If failure occurs at or after `old_deleted`, do not recreate an old branch from memory; resume the staging rename and credential transfer.
-- If credentials appear in output, stop immediately, revoke the service token and database role, preserve only redacted evidence, and block release.
+- If credentials appear in output, stop immediately, revoke the OAuth access token, service token, and database role as applicable, preserve only redacted evidence, and block release.
 - If cleanup cannot be proven, do not tag a release. Record the exact provider resource IDs and resolve ownership first.
 
 ## Release evidence

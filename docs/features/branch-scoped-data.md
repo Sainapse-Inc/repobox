@@ -18,9 +18,9 @@ source_commit: ""
 human_summary: >
   Repobox gives every local Git branch persistent remote PostgreSQL data while application processes remain local. The first implementation uses PlanetScale and Docker Compose through a terminal-only Rust CLI that is equally operable by humans and agents.
 machine_summary: >
-  Repobox maps a repository UUID and Git environment name to isolated PlanetScale Postgres branches, rewrites Compose in memory, persists resumable jobs, and exposes versioned JSON and JSONL contracts.
+  Repobox uses PlanetScale OAuth device or service-token authentication, maps repository and Git identities to isolated Postgres branches, rewrites Compose in memory, persists resumable jobs, and exposes versioned JSON and JSONL contracts.
 decision_required: >
-  Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, forward-only pull semantics, and versioned agent CLI contract described here before the first tagged release.
+  Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, OAuth device login with service-token automation, forward-only pull semantics, and versioned agent CLI contract described here before the first tagged release.
 systems:
   - repobox-cli
   - planetscale-api
@@ -46,7 +46,7 @@ related_docs:
 
 ## Decision required
 
-Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, forward-only pull semantics, and versioned agent CLI contract described here before the first tagged release.
+Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, OAuth device login with service-token automation, forward-only pull semantics, and versioned agent CLI contract described here before the first tagged release.
 
 ## Problem and user need
 
@@ -63,10 +63,11 @@ Without Repobox, each repository invents its own Compose lifecycle, environment-
 1. `repobox init` detects every PostgreSQL service in resolved Docker Compose configuration, writes `.repobox.yml`, and updates managed blocks in `CLAUDE.md` and `AGENTS.md` without replacing surrounding content.
 2. An environment resolves from `--environment`, then `REPOBOX_ENV`, then the current Git branch. `main` is treated exactly like any other environment.
 3. Each configured database service maps to one PlanetScale PostgreSQL database. Repobox restores a branch from the latest successful base-branch backup and selects the smallest eligible numeric cluster SKU unless configuration pins one.
-4. Repobox creates a deterministic role inheriting `postgres`, stores its returned one-time credentials in an OS credential store with an explicit permission-restricted file fallback, and injects pooled/direct URLs only into child-process environments.
-5. The Compose adapter resolves canonical Compose first, removes remote PostgreSQL services and their dependencies in memory, injects connection variables into remaining services, and passes the transformed YAML over stdin. It never edits the repository's Compose files.
-6. `repobox pull` stages fresh branches, provisions credentials and extensions, deletes old environment branches, then renames staging branches forward. If any service fails, local services remain stopped and the durable job can be resumed.
-7. Human terminals receive concise text or a full-screen dashboard. `--json` returns versioned JSON; streams return JSONL; non-interactive mutations require `--yes`; `--dry-run` performs no provider call or repository write.
+4. `repobox auth login` uses PlanetScale OAuth device authorization by default: it opens the approval URL, polls for a Bearer access token, validates it, and stores it outside the repository. JSON mode emits the URL/code as `auth_pending`; unattended automation retains environment-first service-token authentication.
+5. Repobox creates a deterministic role inheriting `postgres`, stores its returned one-time credentials in an OS credential store with an explicit permission-restricted file fallback, and injects pooled/direct URLs only into child-process environments.
+6. The Compose adapter resolves canonical Compose first, removes remote PostgreSQL services and their dependencies in memory, injects connection variables into remaining services, and passes the transformed YAML over stdin. It never edits the repository's Compose files.
+7. `repobox pull` stages fresh branches, provisions credentials and extensions, deletes old environment branches, then renames staging branches forward. If any service fails, local services remain stopped and the durable job can be resumed.
+8. Human terminals receive concise text or a full-screen dashboard. `--json` returns versioned JSON; streams return JSONL; non-interactive mutations require `--yes`; `--dry-run` performs no provider call or repository write.
 
 ## Affected capabilities
 
@@ -82,7 +83,7 @@ Without Repobox, each repository invents its own Compose lifecycle, environment-
 | `repobox-cli` | Clap command grammar | Adds init, run, stop, pull, auth, env, service, job, config, telemetry, update, doctor, completion, and agent-context surfaces. |
 | `repobox-cli` | Ratatui kernel | Adds event-driven setup and dashboard TUIs with coalesced rendering and one frame in flight. |
 | `repobox-core` | Config, identity, state, jobs | Defines strict config, deterministic names, atomic state, structured errors, schemas, and append-only jobs. |
-| `planetscale-api` | PostgreSQL provider | Implements service-token auth, pagination, database/backup/branch/role operations, retries, and request-ID propagation. |
+| `planetscale-api` | PostgreSQL provider | Implements OAuth device authorization, Bearer and service-token API auth, revocation, pagination, database/backup/branch/role operations, retries, and request-ID propagation. |
 | `docker-compose` | Runtime adapter | Detects PostgreSQL services and applies an in-memory Compose transform. |
 | Developer repository | `.repobox.yml`, agent guides | Stores non-secret project intent and idempotent managed instruction blocks. |
 
@@ -154,7 +155,7 @@ flowchart LR
     Human[Developer] -->|terminal commands| Repobox[Repobox CLI]
     Agent[LLM agent] -->|JSON and JSONL| Repobox
     Repo[Local repository] -->|Compose and .repobox.yml| Repobox
-    Repobox -->|HTTPS service-token API| PlanetScale[PlanetScale Postgres]
+    Repobox -->|OAuth Bearer or service-token HTTPS API| PlanetScale[PlanetScale Postgres]
     Repobox -->|transient YAML over stdin| Docker[Docker Compose]
     Repobox -->|credentials| Keyring[OS credential store]
 ```
@@ -192,7 +193,8 @@ Repobox is deliberately a local control plane in v0.1. The provider and runtime 
 | PlanetScale branches create unexpected cost | High | Medium | Require confirmation, emit dry-run provider calls and cost warning, choose the smallest eligible SKU, and make pruning explicit. |
 | `pull` destroys useful environment-local data | High | Medium | Name the destructive effect in help and confirmation, stage before deletion, checkpoint each phase, and never imply rollback exists. |
 | A multi-database operation partially succeeds | Medium | Medium | Preserve successful bindings, mark the environment degraded, keep services stopped during failed pulls, and expose exact resumable job IDs. |
-| Credentials leak through files, argv, or logs | High | Low | Accept the token only via hidden prompt/environment, use keyring or mode-0600 fallback, inject process env in memory, redact URLs, and test repository outputs. |
+| Credentials leak through files, argv, or logs | High | Low | Use device approval or environment-only service secrets, keep tokens in keyring or a mode-0600 fallback, inject process env in memory, redact URLs, and test repository outputs. |
+| The shared public PlanetScale CLI OAuth client changes or is restricted | Medium | Low | Pin the reviewed upstream protocol/client provenance, wire-test the flow, retain service-token fallback, and gate release on live browser login. |
 | Compose transformation changes application semantics | Medium | Medium | Resolve Compose canonically, change only database services/dependencies/env, keep source files untouched, and cover transforms with fixtures. |
 | Terminal rendering flickers or corrupts the shell | Medium | Low | Use dirty/coalesced presentation, Ratatui diff rendering, synchronized updates, dedicated buffered I/O, and RAII terminal restoration. |
 | Provider API behavior drifts | Medium | Medium | Keep the API behind a trait, classify structured failures, test auth/pagination, and gate release on a live smoke run. |
@@ -201,7 +203,7 @@ Repobox is deliberately a local control plane in v0.1. The provider and runtime 
 
 1. Land the Rust workspace, public schemas, documentation, and CI on `main` without publishing a version.
 2. Run all offline tests on Linux and macOS and build the four release targets.
-3. Supply a dedicated PlanetScale organization and service token, execute the live-smoke checklist, verify billable resources and cleanup, and record the tested provider behavior.
+3. Execute browser login plus service-token automation against a dedicated PlanetScale organization, complete the live-smoke checklist, verify billable resources and cleanup, and record the tested provider behavior.
 4. Tag `v0.1.0`; publish checksummed GitHub artifacts, crates, provenance attestations, and a Homebrew formula.
 5. Treat schema or flag removal as a major-version change; additive fields and commands remain backward compatible.
 
@@ -212,7 +214,7 @@ Before a tagged release, revert the implementation commit or remove the unpublis
 ## Test plan
 
 - Unit-test strict config parsing, RFC 7396 validation, name stability/collision resistance, atomic state, job replay, secret redaction, setup guide idempotence, Compose detection/transformation/status parsing, and TUI frame coalescing.
-- Wire-test PlanetScale service-token headers, pagination, and structured permission failures against a local HTTP fixture.
+- Wire-test PlanetScale device authorization, token polling, Bearer and service-token headers, revocation, pagination, and structured permission failures against a local HTTP fixture.
 - Black-box-test help, JSON usage errors, multi-Postgres detection/init, dry-run no-write behavior, schema snapshots, and secret absence in generated repository files.
 - Run `cargo fmt --check`, Clippy with warnings denied, all workspace tests, and package checks in CI.
 - Gate `v0.1.0` on a credentialed live smoke covering auth, create, rerun idempotence, run, pull, interruption/resume, partial failure, delete, and provider cleanup.
@@ -227,13 +229,13 @@ Before a tagged release, revert the implementation commit or remove the unpublis
 
 ## Security and privacy review
 
-PlanetScale service tokens are long-lived secrets. The token value is never accepted as a CLI flag, serialized to project configuration, added to agent guides, or included in dry-run output. Interactive entry uses a hidden prompt; automation uses `PLANETSCALE_SERVICE_TOKEN`. Provider database passwords are one-time responses stored through the OS credential facility, with an explicit local JSON fallback created under the user's configuration directory and permission-restricted to the user.
+Interactive authentication uses PlanetScale's OAuth device flow, never exposes the private device code, stores only the resulting access token, sends it as a Bearer credential, and revokes it before local logout. The device approval URL and human confirmation code are intentionally public handoff values and may appear in JSONL; access tokens may not. A browser token is also revoked after dry-run validation or a credential-storage failure so an untracked token is not intentionally left active. Service tokens remain the unattended path: the secret is never accepted as a CLI flag, serialized to project configuration, added to agent guides, or included in dry-run output. Existing stored service-token records decode without migration work. Provider database passwords are one-time responses stored through the OS credential facility, with an explicit local JSON fallback created under the user's configuration directory and permission-restricted to the user.
 
 Data copy is opt-in through `data.allow_copy: true`. Import streams `pg_dump` directly into `psql`, creates no dump file, and stops a local Compose database only if Repobox started it. Repobox does not mask or anonymize imported data in v0.1, so users remain responsible for the classification of source data. Remote branches and backups may be billable and must be created only in an authorized organization.
 
 ## Open questions
 
-None — all v0.1 product and implementation choices were resolved before implementation. Hosted compute, masking hooks, additional database providers, and periodic source resync are explicitly later-version work rather than hidden v0.1 unknowns.
+Before the first tag, decide whether PlanetScale should issue Repobox a dedicated public OAuth client. The implementation currently follows the official CLI's intentionally non-confidential device client and keeps service-token auth as a fallback. Hosted compute, masking hooks, additional database providers, and periodic source resync remain later-version work.
 
 ## Reviewer prompts
 
@@ -249,7 +251,8 @@ None — all v0.1 product and implementation choices were resolved before implem
 
 ### Security reviewer
 
-- Can any service token, role password, or connection URL reach argv, repository files, diagnostics, job records, or generated agent instructions?
+- Can any OAuth access token, service token, role password, or connection URL reach argv, repository files, diagnostics, job records, or generated agent instructions?
+- Is using PlanetScale CLI's public non-confidential OAuth client acceptable for v0.1, or must Repobox receive a dedicated client before tagging?
 - Is the permission-restricted credential fallback explicit enough for systems without a usable native keyring?
 
 ### Operations reviewer

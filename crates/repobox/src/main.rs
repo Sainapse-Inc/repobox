@@ -71,6 +71,10 @@ async fn main() -> ExitCode {
                 | cli::Command::Job(cli::JobCommand::Resume(_) | cli::JobCommand::Cancel(_))
         )
     );
+    let authentication_on_interrupt = matches!(
+        cli.command.as_ref(),
+        Some(cli::Command::Auth(cli::AuthCommand::Login(_)))
+    );
     let result = if checkpoint_on_interrupt {
         tokio::select! {
             result = app::run(cli, &output) => result,
@@ -83,6 +87,18 @@ async fn main() -> ExitCode {
                 .with_suggestion(
                     "Run `repobox job view latest --json`, then resume the exact job UUID.",
                 ),
+            ),
+        }
+    } else if authentication_on_interrupt {
+        tokio::select! {
+            result = app::run(cli, &output) => result,
+            () = termination_signal() => Err(
+                RepoboxError::new(
+                    ErrorKind::Authentication,
+                    "authentication_interrupted",
+                    "PlanetScale authentication was interrupted before completion",
+                )
+                .with_suggestion("Run `repobox auth login` to request a new confirmation code."),
             ),
         }
     } else {

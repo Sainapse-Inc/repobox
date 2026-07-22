@@ -21,9 +21,46 @@ const DEFAULT_API_URL: &str = "https://api.planetscale.com/v1";
 const MAX_RETRIES: usize = 4;
 
 #[derive(Clone, Debug)]
-pub struct PlanetScaleCredentials {
-    pub token_id: SecretString,
-    pub token: SecretString,
+pub enum PlanetScaleCredentials {
+    AccessToken {
+        token: SecretString,
+    },
+    ServiceToken {
+        token_id: SecretString,
+        token: SecretString,
+    },
+}
+
+impl PlanetScaleCredentials {
+    pub fn access_token(token: impl Into<String>) -> Self {
+        Self::AccessToken {
+            token: SecretString::from(token.into()),
+        }
+    }
+
+    pub fn service_token(token_id: impl Into<String>, token: impl Into<String>) -> Self {
+        Self::ServiceToken {
+            token_id: SecretString::from(token_id.into()),
+            token: SecretString::from(token.into()),
+        }
+    }
+
+    pub const fn method(&self) -> &'static str {
+        match self {
+            Self::AccessToken { .. } => "browser_oauth",
+            Self::ServiceToken { .. } => "service_token",
+        }
+    }
+
+    fn authenticate(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        match self {
+            Self::AccessToken { token } => request.bearer_auth(token.expose_secret()),
+            Self::ServiceToken { token_id, token } => request.header(
+                reqwest::header::AUTHORIZATION,
+                format!("{}:{}", token_id.expose_secret(), token.expose_secret()),
+            ),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -64,16 +101,11 @@ impl PlanetScaleClient {
         let url = format!("{}{}", self.base_url, path);
         let retryable = method == Method::GET;
         for attempt in 0..=MAX_RETRIES {
-            let auth = format!(
-                "{}:{}",
-                self.credentials.token_id.expose_secret(),
-                self.credentials.token.expose_secret()
+            let mut request = self.credentials.authenticate(
+                self.http
+                    .request(method.clone(), &url)
+                    .header(reqwest::header::ACCEPT, "application/json"),
             );
-            let mut request = self
-                .http
-                .request(method.clone(), &url)
-                .header(reqwest::header::AUTHORIZATION, auth)
-                .header(reqwest::header::ACCEPT, "application/json");
             if let Some(body) = body {
                 request = request.json(body);
             }
@@ -138,15 +170,7 @@ impl PlanetScaleClient {
     async fn delete(&self, path: &str, body: Option<&serde_json::Value>) -> Result<()> {
         let url = format!("{}{}", self.base_url, path);
         for attempt in 0..=MAX_RETRIES {
-            let auth = format!(
-                "{}:{}",
-                self.credentials.token_id.expose_secret(),
-                self.credentials.token.expose_secret()
-            );
-            let mut request = self
-                .http
-                .delete(&url)
-                .header(reqwest::header::AUTHORIZATION, auth);
+            let mut request = self.credentials.authenticate(self.http.delete(&url));
             if let Some(body) = body {
                 request = request.json(body);
             }
@@ -576,10 +600,7 @@ mod tests {
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     fn credentials() -> PlanetScaleCredentials {
-        PlanetScaleCredentials {
-            token_id: SecretString::from("token-id".to_owned()),
-            token: SecretString::from("token-secret".to_owned()),
-        }
+        PlanetScaleCredentials::service_token("token-id", "token-secret")
     }
 
     #[tokio::test]
@@ -597,6 +618,28 @@ mod tests {
             .mount(&server)
             .await;
         let client = PlanetScaleClient::with_base_url(credentials(), server.uri()).unwrap();
+        client.validate_auth().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn browser_auth_uses_bearer_access_token() {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/organizations"))
+            .and(query_param("page", "1"))
+            .and(query_param("per_page", "1"))
+            .and(header("authorization", "Bearer access-token"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "data": [],
+                "next_page": null
+            })))
+            .mount(&server)
+            .await;
+        let client = PlanetScaleClient::with_base_url(
+            PlanetScaleCredentials::access_token("access-token"),
+            server.uri(),
+        )
+        .unwrap();
         client.validate_auth().await.unwrap();
     }
 

@@ -6,7 +6,7 @@ Repobox declares tier **T3: platform CLI**. It has authentication, remote provid
 - Audience: developers, shell automation, and LLM agents
 - Nouns: auth, environments, services, jobs, config, telemetry
 - Long-running operations: environment create/pull/resume, runtime, and logs
-- Auth: browser-assisted PlanetScale service-token acquisition for humans; environment variables for CI
+- Auth: OAuth device-code browser login for humans and agents coordinating approval; environment service tokens for unattended CI
 
 The canonical command tree and representative annotated `run` implementation are in [Agent and automation contract](agent-contract.md).
 
@@ -18,6 +18,9 @@ All command help pages include concrete examples.
 
 $ target/debug/repobox --json --version | jq -r '.command + " " + .data.version'
 version 0.1.0
+
+$ repobox auth login --json --no-input --no-browser
+{"schema_version":1,"event":"auth_pending","data":{"status":"pending","method":"browser_oauth","verification_url":"https://...","user_code":"...","browser_opened":false,"expires_in_seconds":300}}
 
 $ target/debug/repobox agent-context --schemas --json |
     jq '.data | {schema_version, command_groups: (.commands.subcommands | length), exit_codes: .contract.exit_codes}'
@@ -35,7 +38,7 @@ $ target/debug/repobox agent-context --schemas --json |
 }
 
 $ cargo test --workspace --all-targets --locked
-38 tests passed
+47 tests passed
 ```
 
 The exact test count is expected to grow; CI treats any failure as blocking.
@@ -46,10 +49,10 @@ The exact test count is expected to grow; CI treats any failure as blocking.
 |---|---|---|
 | Command grammar | yes | `cli.rs` uses top-level workflow utilities and noun/verb groups with at most one subject positional. |
 | Help and disclosure | yes | No args prints full help; every recursive page has examples; help topics and a recursive `agent-context` manifest ship. |
-| Output modes | yes | Immediate JSON, long-operation JSONL, committed schemas, and schema-drift tests. |
+| Output modes | yes | Immediate JSON, device-auth and long-operation JSONL, committed schemas, and schema-drift tests. |
 | Stdout and stderr | yes | Data uses stdout; diagnostics/errors/update notices use stderr; JSON Compose operations suppress child chatter. |
 | Exit codes | yes | One `ErrorKind` mapping defines stable exits 1–6 and the help topic documents them. |
-| Auth | yes | Browser-assisted hidden entry for humans, environment credentials for CI, and unauthenticated status exits 4. |
+| Auth | yes | OAuth device login for humans, JSONL URL/code handoff for agents, environment service tokens for CI, revocation on logout, and unauthenticated status exit 4. |
 | TTY and interactivity | yes | Prompt gates use `IsTerminal`; `--no-input`, `--yes`, and `NO_COLOR` are global. |
 | Errors as UI | yes | Errors include kind, stable code, summary, suggestion, optional request ID/doc URL; mutations include undo metadata. |
 | Config cascade | yes | Flag > env > project > user > default; structured input is flag > pipe > prompt. |

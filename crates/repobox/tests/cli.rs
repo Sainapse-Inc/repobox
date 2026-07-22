@@ -76,8 +76,21 @@ fn service_token_secret_is_not_an_argv_flag() {
         .args(["auth", "login", "--help"])
         .assert()
         .success()
+        .stdout(predicate::str::contains("browser"))
+        .stdout(predicate::str::contains("--no-browser"))
         .stdout(predicate::str::contains("PLANETSCALE_SERVICE_TOKEN=secret"))
         .stdout(predicate::str::contains("--token ").not());
+}
+
+#[test]
+fn human_browser_login_rejects_a_non_tty_before_network_access() {
+    Command::cargo_bin("repobox")
+        .unwrap()
+        .args(["auth", "login", "--no-browser"])
+        .assert()
+        .code(4)
+        .stderr(predicate::str::contains("interactive_shell_required"))
+        .stderr(predicate::str::contains("--json --no-input"));
 }
 
 #[test]

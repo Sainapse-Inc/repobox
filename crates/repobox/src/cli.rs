@@ -263,15 +263,15 @@ pub struct LogsArgs {
 
 #[derive(Clone, Debug, Subcommand)]
 pub enum AuthCommand {
-    /// Store and validate `PlanetScale` service-token credentials.
+    /// Authenticate through a browser or service-token environment variables.
     #[command(
-        after_long_help = "EXAMPLES:\n  repobox auth login\n  PLANETSCALE_SERVICE_TOKEN_ID=id PLANETSCALE_SERVICE_TOKEN=secret repobox auth login --no-input --json"
+        after_long_help = "EXAMPLES:\n  repobox auth login\n  repobox auth login --no-browser\n  repobox auth login --json --no-input\n  export PLANETSCALE_SERVICE_TOKEN_ID=id\n  export PLANETSCALE_SERVICE_TOKEN=secret\n  repobox auth login --no-input --json"
     )]
     Login(AuthLoginArgs),
     /// Show where credentials resolve from and validate them.
     #[command(after_long_help = "EXAMPLES:\n  repobox auth status\n  repobox auth status --json")]
     Status,
-    /// Remove locally stored credentials.
+    /// Revoke browser auth and remove locally stored credentials.
     #[command(
         after_long_help = "EXAMPLES:\n  repobox auth logout\n  repobox auth logout --yes --no-input --json"
     )]
@@ -280,11 +280,11 @@ pub enum AuthCommand {
 
 #[derive(Clone, Debug, Args)]
 pub struct AuthLoginArgs {
-    /// `PlanetScale` service token ID. Prefer the environment variable for agents.
+    /// Use service-token auth with this ID instead of browser auth.
     #[arg(long, env = "PLANETSCALE_SERVICE_TOKEN_ID")]
     pub token_id: Option<String>,
 
-    /// Do not open the `PlanetScale` token settings page.
+    /// Print the device-approval URL without opening a browser.
     #[arg(long)]
     pub no_browser: bool,
 }

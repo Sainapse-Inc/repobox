@@ -13,9 +13,10 @@ use repobox_core::provider::DatabaseProvider;
 use repobox_core::runtime::RuntimeDriver;
 use repobox_core::state::EnvironmentStatus;
 use repobox_core::{ErrorKind, RepoboxError, Result};
-use repobox_provider_planetscale::{PlanetScaleClient, PlanetScaleCredentials};
+use repobox_provider_planetscale::{
+    PlanetScaleClient, PlanetScaleCredentials, PlanetScaleDeviceAuth,
+};
 use repobox_runtime_compose::{ComposeRuntime, detect_configuration};
-use secrecy::SecretString;
 use serde::Serialize;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command as TokioCommand;
@@ -701,60 +702,7 @@ async fn auth(cli: &Cli, output: &Output, command: AuthCommand) -> Result<()> {
     let paths = RepoboxPaths::discover()?;
     let store = CredentialStore::new(paths.credentials_file());
     match command {
-        AuthCommand::Login(args) => {
-            let token_id = match args.token_id {
-                Some(value) => value,
-                None if !cli.no_input && io::stdin().is_terminal() => {
-                    if !args.no_browser {
-                        open_browser("https://app.planetscale.com/settings/service-tokens");
-                    }
-                    eprint!("PlanetScale service token ID: ");
-                    io::stderr().flush()?;
-                    let mut value = String::new();
-                    io::stdin().read_line(&mut value)?;
-                    value.trim().to_owned()
-                }
-                None => return Err(authentication_input_required()),
-            };
-            let token = match std::env::var("PLANETSCALE_SERVICE_TOKEN") {
-                Ok(value) if !value.is_empty() => value,
-                _ if !cli.no_input && io::stdin().is_terminal() => {
-                    rpassword::prompt_password("PlanetScale service token: ")?
-                }
-                _ => return Err(authentication_input_required()),
-            };
-            let credentials = PlanetScaleCredentials {
-                token_id: SecretString::from(token_id),
-                token: SecretString::from(token),
-            };
-            let provider = PlanetScaleClient::new(credentials.clone())?;
-            provider.validate_auth().await?;
-            let source = if cli.dry_run {
-                None
-            } else {
-                Some(store.store_provider(&credentials)?)
-            };
-            let data = serde_json::json!({
-                "authenticated": true,
-                "stored": !cli.dry_run,
-                "source": source,
-            });
-            if cli.dry_run {
-                output.human_or_data(
-                    "auth login",
-                    &data,
-                    "credentials are valid; nothing stored (dry run)",
-                )
-            } else {
-                output.mutation(
-                    "auth login",
-                    &data,
-                    "authenticated with PlanetScale",
-                    Some("repobox auth logout --yes".to_owned()),
-                    None,
-                )
-            }
-        }
+        AuthCommand::Login(args) => auth_login(cli, output, &store, &args).await,
         AuthCommand::Status => {
             let status = store.status()?;
             if !status.configured {
@@ -769,18 +717,45 @@ async fn auth(cli: &Cli, output: &Output, command: AuthCommand) -> Result<()> {
             }
             let (credentials, _) = store.provider_credentials()?;
             PlanetScaleClient::new(credentials)?.validate_auth().await?;
+            let human = format!(
+                "PlanetScale {} credentials are configured and valid",
+                status.method.map_or("provider", |method| match method {
+                    crate::credentials::CredentialMethod::BrowserOauth => "browser OAuth",
+                    crate::credentials::CredentialMethod::ServiceToken => "service-token",
+                })
+            );
             output.human_or_data(
                 "auth status",
                 &serde_json::json!({"credentials": status, "valid": true}),
-                "PlanetScale credentials are configured and valid",
+                &human,
             )
         }
         AuthCommand::Logout => {
             confirm(cli, "Remove locally stored PlanetScale credentials?")?;
+            let stored = store.stored_provider_credentials()?;
+            let method = stored.as_ref().map(|(credentials, _)| credentials.method());
+            let revoke_required = matches!(
+                stored.as_ref(),
+                Some((PlanetScaleCredentials::AccessToken { .. }, _))
+            );
+            let mut revoked = false;
             if !cli.dry_run {
+                if let Some((PlanetScaleCredentials::AccessToken { token }, _)) = &stored {
+                    PlanetScaleDeviceAuth::new()?.revoke(token).await?;
+                    revoked = true;
+                }
                 store.remove_provider()?;
             }
-            let data = serde_json::json!({"removed": !cli.dry_run});
+            let environment_override_active = std::env::var_os("PLANETSCALE_SERVICE_TOKEN_ID")
+                .is_some()
+                || std::env::var_os("PLANETSCALE_SERVICE_TOKEN").is_some();
+            let data = serde_json::json!({
+                "removed": !cli.dry_run && stored.is_some(),
+                "revoke_required": revoke_required,
+                "revoked": revoked,
+                "method": method,
+                "environment_override_active": environment_override_active,
+            });
             if cli.dry_run {
                 output.human_or_data(
                     "auth logout",
@@ -788,15 +763,212 @@ async fn auth(cli: &Cli, output: &Output, command: AuthCommand) -> Result<()> {
                     "would remove stored PlanetScale credentials",
                 )
             } else {
+                let human = if stored.is_some() {
+                    "removed stored PlanetScale credentials"
+                } else {
+                    "no stored PlanetScale credentials were present"
+                };
                 output.mutation(
                     "auth logout",
                     &data,
-                    "removed stored PlanetScale credentials",
+                    human,
                     None,
                     Some("removed secrets cannot be reconstructed by Repobox".to_owned()),
                 )
             }
         }
+    }
+}
+
+async fn auth_login(
+    cli: &Cli,
+    output: &Output,
+    store: &CredentialStore,
+    args: &crate::cli::AuthLoginArgs,
+) -> Result<()> {
+    let service_token_requested = args.token_id.is_some()
+        || std::env::var_os("PLANETSCALE_SERVICE_TOKEN_ID").is_some()
+        || std::env::var_os("PLANETSCALE_SERVICE_TOKEN").is_some();
+    if service_token_requested {
+        service_token_login(cli, output, store, args).await
+    } else {
+        device_login(cli, output, store, args).await
+    }
+}
+
+async fn service_token_login(
+    cli: &Cli,
+    output: &Output,
+    store: &CredentialStore,
+    args: &crate::cli::AuthLoginArgs,
+) -> Result<()> {
+    let token_id = match &args.token_id {
+        Some(value) if !value.is_empty() => value.clone(),
+        _ if !cli.no_input && io::stdin().is_terminal() => {
+            eprint!("PlanetScale service token ID: ");
+            io::stderr().flush()?;
+            let mut value = String::new();
+            io::stdin().read_line(&mut value)?;
+            value.trim().to_owned()
+        }
+        _ => return Err(authentication_input_required()),
+    };
+    let token = match std::env::var("PLANETSCALE_SERVICE_TOKEN") {
+        Ok(value) if !value.is_empty() => value,
+        _ if !cli.no_input && io::stdin().is_terminal() => {
+            rpassword::prompt_password("PlanetScale service token: ")?
+        }
+        _ => return Err(authentication_input_required()),
+    };
+    finish_auth_login(
+        cli,
+        output,
+        store,
+        PlanetScaleCredentials::service_token(token_id, token),
+        false,
+    )
+    .await
+}
+
+#[derive(Serialize)]
+struct AuthPending<'a> {
+    status: &'static str,
+    method: &'static str,
+    verification_url: &'a str,
+    user_code: &'a str,
+    browser_opened: bool,
+    expires_in_seconds: u64,
+}
+
+async fn device_login(
+    cli: &Cli,
+    output: &Output,
+    store: &CredentialStore,
+    args: &crate::cli::AuthLoginArgs,
+) -> Result<()> {
+    if !output.json() && (!io::stdin().is_terminal() || !io::stderr().is_terminal()) {
+        return Err(RepoboxError::new(
+            ErrorKind::Authentication,
+            "interactive_shell_required",
+            "browser login requires an interactive terminal in human output mode",
+        )
+        .with_suggestion(
+            "Use `repobox auth login --json --no-input` for a machine-readable device flow, or set service-token environment variables.",
+        ));
+    }
+    let authenticator = PlanetScaleDeviceAuth::new()?;
+    let authorization = authenticator.start().await?;
+    let browser_opened = !args.no_browser && open_browser(authorization.verification_url());
+    let pending = AuthPending {
+        status: "pending",
+        method: "browser_oauth",
+        verification_url: authorization.verification_url(),
+        user_code: authorization.user_code(),
+        browser_opened,
+        expires_in_seconds: authorization.expires_in().as_secs(),
+    };
+    if output.json() {
+        output.stream("auth_pending", &pending)?;
+    } else {
+        eprintln!(
+            "\nPlanetScale confirmation code: {}",
+            authorization.user_code()
+        );
+        if browser_opened {
+            eprintln!(
+                "Approve access in the browser, or open:\n{}\n",
+                authorization.verification_url()
+            );
+        } else {
+            eprintln!(
+                "Open this URL to approve access:\n{}\n",
+                authorization.verification_url()
+            );
+        }
+        output.progress("Waiting for PlanetScale approval...");
+    }
+    let token = authenticator.wait_for_access_token(&authorization).await?;
+    finish_auth_login(
+        cli,
+        output,
+        store,
+        PlanetScaleCredentials::AccessToken { token },
+        true,
+    )
+    .await
+}
+
+async fn finish_auth_login(
+    cli: &Cli,
+    output: &Output,
+    store: &CredentialStore,
+    credentials: PlanetScaleCredentials,
+    streamed: bool,
+) -> Result<()> {
+    PlanetScaleClient::new(credentials.clone())?
+        .validate_auth()
+        .await?;
+    let mut revoked_after_validation = false;
+    let source = if cli.dry_run {
+        if let PlanetScaleCredentials::AccessToken { token } = &credentials {
+            PlanetScaleDeviceAuth::new()?.revoke(token).await?;
+            revoked_after_validation = true;
+        }
+        None
+    } else {
+        match store.store_provider(&credentials) {
+            Ok(source) => Some(source),
+            Err(storage_error) => {
+                if let PlanetScaleCredentials::AccessToken { token } = &credentials {
+                    return match PlanetScaleDeviceAuth::new()?.revoke(token).await {
+                        Ok(()) => Err(storage_error.with_suggestion(
+                            "The browser token was revoked. Fix OS keyring or config-directory permissions, then rerun `repobox auth login`.",
+                        )),
+                        Err(revoke_error) => Err(RepoboxError::new(
+                            ErrorKind::Runtime,
+                            "credential_store_and_token_revoke_failed",
+                            format!(
+                                "credential storage failed ({storage_error}); cleanup also failed ({revoke_error})"
+                            ),
+                        )
+                        .with_suggestion(
+                            "Revoke PlanetScale CLI authorization in PlanetScale account settings, fix local credential storage, then retry.",
+                        )),
+                    };
+                }
+                return Err(storage_error);
+            }
+        }
+    };
+    let data = serde_json::json!({
+        "authenticated": true,
+        "method": credentials.method(),
+        "stored": !cli.dry_run,
+        "source": source,
+        "revoked_after_validation": revoked_after_validation,
+    });
+    if streamed && output.json() {
+        return output.stream_mutation(
+            &data,
+            (!cli.dry_run).then(|| "repobox auth logout --yes".to_owned()),
+            cli.dry_run
+                .then(|| "dry-run authentication did not store credentials".to_owned()),
+        );
+    }
+    if cli.dry_run {
+        output.human_or_data(
+            "auth login",
+            &data,
+            "credentials are valid; nothing stored (dry run)",
+        )
+    } else {
+        output.mutation(
+            "auth login",
+            &data,
+            "authenticated with PlanetScale",
+            Some("repobox auth logout --yes".to_owned()),
+            None,
+        )
     }
 }
 
@@ -1536,6 +1708,15 @@ async fn agent_context(output: &Output, repository: &Path, schemas: bool) -> Res
             "non_interactive_flag": "--no-input",
             "stream_format": "jsonl",
             "secrets_in_output": false,
+            "authentication": {
+                "human_command": "repobox auth login",
+                "agent_device_command": "repobox auth login --json --no-input",
+                "device_pending_event": "auth_pending",
+                "unattended_environment": [
+                    "PLANETSCALE_SERVICE_TOKEN_ID",
+                    "PLANETSCALE_SERVICE_TOKEN"
+                ]
+            },
             "exit_codes": {
                 "1": "runtime",
                 "2": "usage",
@@ -1546,6 +1727,7 @@ async fn agent_context(output: &Output, repository: &Path, schemas: bool) -> Res
             }
         },
         "recommended_sequence": [
+            "repobox auth status --json --no-input",
             "repobox config detect --json",
             "repobox status --json",
             "repobox run --detach --yes --json --no-input"
@@ -1625,11 +1807,11 @@ fn help(output: &Output, args: &HelpArgs) -> Result<()> {
         ),
         "setup" => (
             "setup",
-            "Human: `repobox auth login && repobox run`. Agent: `repobox config detect --json`, then `repobox init --organization ORG --database SERVICE=DB --yes --json`.",
+            "Human: `repobox auth login && repobox run`. Agent: check `repobox auth status --json --no-input`; if approval is needed, run `repobox auth login --json --no-input` and surface its URL/code, then detect and initialize the repository.",
         ),
         "agents" => (
             "agents",
-            "Call `repobox agent-context --json` first. Add `--json` to every command, `--yes --no-input` to approved mutations, and `--dry-run` before destructive or billable operations. Streaming commands emit JSONL.",
+            "Call `repobox agent-context --json` first. Browser auth is agent-operable through `auth login --json --no-input`: surface the `auth_pending` URL/code and wait for `result`. Add `--json` to every command, `--yes --no-input` to approved mutations, and `--dry-run` before destructive or billable operations. Streaming commands emit JSONL.",
         ),
         "data" => (
             "data",
@@ -1848,10 +2030,7 @@ fn provider(store: &CredentialStore) -> Result<PlanetScaleClient> {
 }
 
 fn planning_provider() -> Result<PlanetScaleClient> {
-    PlanetScaleClient::new(PlanetScaleCredentials {
-        token_id: SecretString::from(String::new()),
-        token: SecretString::from(String::new()),
-    })
+    PlanetScaleClient::new(PlanetScaleCredentials::service_token("", ""))
 }
 
 fn confirm(cli: &Cli, message: &str) -> Result<()> {
@@ -1927,26 +2106,27 @@ fn authentication_input_required() -> RepoboxError {
     )
 }
 
-fn open_browser(url: &str) {
+fn open_browser(url: &str) -> bool {
     if let Some(browser) =
         std::env::var_os("REPOBOX_BROWSER").or_else(|| std::env::var_os("BROWSER"))
     {
-        let _ = std::process::Command::new(browser)
+        return std::process::Command::new(browser)
             .arg(url)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
-            .spawn();
-        return;
+            .spawn()
+            .is_ok();
     }
     #[cfg(target_os = "macos")]
     let command = ("open", vec![url]);
     #[cfg(not(target_os = "macos"))]
     let command = ("xdg-open", vec![url]);
-    let _ = std::process::Command::new(command.0)
+    std::process::Command::new(command.0)
         .args(command.1)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .spawn();
+        .spawn()
+        .is_ok()
 }
 
 fn read_telemetry(path: &Path) -> Result<bool> {
@@ -1964,5 +2144,41 @@ fn read_telemetry(path: &Path) -> Result<bool> {
         }
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(false),
         Err(error) => Err(error.into()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::AuthPending;
+
+    #[test]
+    fn auth_pending_contains_only_public_handoff_values() {
+        let value = serde_json::to_value(AuthPending {
+            status: "pending",
+            method: "browser_oauth",
+            verification_url: "https://example.test/device",
+            user_code: "ABCD-EFGH",
+            browser_opened: false,
+            expires_in_seconds: 300,
+        })
+        .unwrap();
+        let mut keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "browser_opened",
+                "expires_in_seconds",
+                "method",
+                "status",
+                "user_code",
+                "verification_url",
+            ]
+        );
     }
 }

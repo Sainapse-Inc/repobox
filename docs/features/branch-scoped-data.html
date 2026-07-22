@@ -22,13 +22,13 @@
 </ul></aside>
 
 <main>
-<div class="callout"><strong>Decision required:</strong> Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, forward-only pull semantics, and versioned agent CLI contract before the first tagged release.</div>
+<div class="callout"><strong>Decision required:</strong> Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, OAuth device login with service-token automation, forward-only pull semantics, and versioned agent CLI contract before the first tagged release.</div>
 
 <h2 id="summary">Summary</h2>
 <p><code>repobox run</code> loads or detects a repository, provisions isolated remote PostgreSQL data for the Git environment, injects credentials into local processes, and presents logs in a fast terminal UI. Provider mutations are checkpointed, while automation receives versioned JSON or JSONL.</p>
 
 <h2 id="decision">Decision required</h2>
-<p>Confirm the v0.1 boundaries above. Hosted compute, additional providers, masking hooks, and periodic source resync remain later work.</p>
+<p>Confirm the v0.1 boundaries above, including device-code browser authentication for humans and service-token environment authentication for unattended callers. Hosted compute, additional providers, masking hooks, and periodic source resync remain later work.</p>
 
 <h2 id="problem">Problem and user need</h2>
 <p>Databases consume local disk and memory, are slow to reconstruct, and are commonly shared accidentally across branches. Repositories also lack a standard, secret-safe way to tell humans and agents how to acquire the correct durable development data.</p>
@@ -37,7 +37,7 @@
 <p>Each repository invents its own Compose lifecycle, environment-file convention, and database copy scripts. Branches usually share mutable data, secrets leak into local files, and failed provider work has no durable recovery handle.</p>
 
 <h2 id="proposed">Proposed behavior</h2>
-<ol><li>Detect every Compose PostgreSQL service and create strict project configuration plus managed agent-guide blocks.</li><li>Map the selected Git environment, including <code>main</code>, to deterministic PlanetScale branches.</li><li>Store one-time role credentials outside the repository and inject URLs only into child-process environments.</li><li>Remove remote database services from an in-memory Compose model and pass transient YAML over stdin.</li><li>Stage and checkpoint forward-only refreshes so partial failures can resume without guessing.</li><li>Require confirmation for destructive or billable work and expose dry-run, JSON, and JSONL forms.</li></ol>
+<ol><li>Detect every Compose PostgreSQL service and create strict project configuration plus managed agent-guide blocks.</li><li>Map the selected Git environment, including <code>main</code>, to deterministic PlanetScale branches.</li><li>Use OAuth device authorization by default, emitting an <code>auth_pending</code> URL/code event for JSON callers, while retaining environment-first service tokens for unattended automation.</li><li>Store one-time role credentials outside the repository and inject URLs only into child-process environments.</li><li>Remove remote database services from an in-memory Compose model and pass transient YAML over stdin.</li><li>Stage and checkpoint forward-only refreshes so partial failures can resume without guessing.</li><li>Require confirmation for destructive or billable work and expose dry-run, JSON, and JSONL forms.</li></ol>
 
 <h2 id="capabilities">Affected capabilities</h2>
 <ul><li>Branch-scoped development data</li><li>Agent-native dev environments</li><li>Local runtime orchestration</li><li>Durable provider operations</li></ul>
@@ -46,7 +46,7 @@
 <table><thead><tr><th>System</th><th>Component</th><th>Impact</th></tr></thead><tbody>
 <tr><td><code>repobox-cli</code></td><td>CLI and TUI</td><td>Human and agent command surface plus event-driven terminal rendering.</td></tr>
 <tr><td><code>repobox-core</code></td><td>Config, identity, state, jobs</td><td>Strict contracts, atomic state, deterministic names, and durable operations.</td></tr>
-<tr><td><code>planetscale-api</code></td><td>Provider adapter</td><td>Database, backup, branch, role, retry, pagination, and request-ID handling.</td></tr>
+<tr><td><code>planetscale-api</code></td><td>Provider adapter</td><td>OAuth device authorization, Bearer and service-token auth, revocation, database, backup, branch, role, retry, pagination, and request-ID handling.</td></tr>
 <tr><td><code>docker-compose</code></td><td>Runtime adapter</td><td>Postgres detection and repository-preserving transient transforms.</td></tr>
 </tbody></table>
 
@@ -82,28 +82,29 @@ error:    { schema_version, error: { kind, code, message, ... } }</code></pre>
 <tr><td>Destructive pull</td><td>High</td><td>Medium</td><td>Staging, explicit warning, phase checkpoints, no false rollback claim.</td></tr>
 <tr><td>Partial multi-database work</td><td>Medium</td><td>Medium</td><td>Degraded state, preserved successes, resumable job ID.</td></tr>
 <tr><td>Credential leakage</td><td>High</td><td>Low</td><td>No secret flags/files; keyring, process env, redaction, tests.</td></tr>
+<tr><td>Shared public OAuth client changes</td><td>Medium</td><td>Low</td><td>Reviewed upstream provenance, wire tests, service-token fallback, and live browser-login gate.</td></tr>
 </tbody></table>
 
 <h2 id="rollout">Rollout and migration plan</h2>
-<ol><li>Land implementation, schemas, docs, and CI without a tag.</li><li>Verify offline on Linux and macOS.</li><li>Run the credentialed provider smoke and clean every resource.</li><li>Tag v0.1.0 and publish checksummed, attested artifacts, crates, and Homebrew formula.</li></ol>
+<ol><li>Land implementation, schemas, docs, and CI without a tag.</li><li>Verify offline on Linux and macOS.</li><li>Run browser login and service-token automation in the credentialed provider smoke, then clean every resource.</li><li>Resolve whether Repobox needs a dedicated PlanetScale OAuth client.</li><li>Tag v0.1.0 and publish checksummed, attested artifacts, crates, and Homebrew formula.</li></ol>
 <h3>Rollback plan</h3><p>Before release, revert the bootstrap. After release, deprecate the affected release and publish a patch. Remote environments are only deleted by an explicit <code>repobox env delete NAME --yes</code>. Interrupted pulls resume forward; deleted old branch data has no rollback.</p>
 
 <h2 id="tests">Test plan</h2>
-<ul><li>Unit tests for config, identity, state, jobs, redaction, guides, Compose, and TUI coalescing.</li><li>Provider wire tests for authentication, pagination, and permission errors.</li><li>Black-box tests for help, structured errors, detection/init, dry-run, and schemas.</li><li>Release-gating live smoke for create, rerun, run, pull, interruption, degraded state, delete, and cleanup.</li></ul>
+<ul><li>Unit tests for config, credential migration, identity, state, jobs, redaction, guides, Compose, and TUI coalescing.</li><li>Provider wire tests for device authorization, polling, Bearer and service-token headers, revocation, pagination, and permission errors.</li><li>Black-box tests for auth TTY behavior, help, structured errors, detection/init, dry-run, and schemas.</li><li>Release-gating live smoke for browser auth, service-token automation, create, rerun, run, pull, interruption, degraded state, delete, and cleanup.</li></ul>
 
 <h2 id="observability">Observability and operations</h2>
 <p>Atomic project state and append-only jobs record bindings, steps, failures, and timestamps. Status, service status, job view, and doctor commands expose that state; request IDs appear on provider failures. v0.1 sends no telemetry events.</p>
 
 <h2 id="security">Security and privacy review</h2>
-<p>Tokens are entered through a hidden prompt or environment variable and never accepted as secret flags. Role URLs stay in the OS credential store or a permission-restricted explicit fallback. Local import is opt-in, streams without a dump file, and performs no masking, so users remain responsible for source-data classification.</p>
+<p>Interactive auth exposes only the public approval URL and confirmation code, keeps the private device code and Bearer access token out of output, and revokes the access token on logout, after dry-run validation, or after a credential-storage failure. Service-token secrets remain environment-only or hidden-prompt values and are never accepted as secret flags. Existing service-token records remain readable. Role URLs stay in the OS credential store or a permission-restricted explicit fallback. Local import is opt-in, streams without a dump file, and performs no masking, so users remain responsible for source-data classification.</p>
 
 <h2 id="open">Open questions</h2>
-<p>None — v0.1 choices were resolved before implementation. Hosted compute and periodic resync are later-version work.</p>
+<p>Before the first tag, decide whether PlanetScale should issue Repobox a dedicated public OAuth client. The implementation currently follows the official CLI's intentionally non-confidential device client and keeps service-token auth as a fallback. Hosted compute and periodic resync remain later-version work.</p>
 
 <h2 id="reviewers">Reviewer prompts</h2>
 <h3>Architecture reviewer</h3><ul><li>Does the provider/runtime boundary preserve the hosted-compute path?</li><li>Can every pull failure phase resume without guessing?</li></ul>
 <h3>API reviewer</h3><ul><li>Are structured contracts additive and sufficient for LLM recovery?</li></ul>
-<h3>Security reviewer</h3><ul><li>Can any secret reach argv, project files, diagnostics, or jobs?</li></ul>
+<h3>Security reviewer</h3><ul><li>Can any OAuth access token, service token, role password, or connection URL reach argv, project files, diagnostics, or jobs?</li><li>Is the official CLI's public OAuth client acceptable for v0.1, or must Repobox receive a dedicated client before tagging?</li></ul>
 <h3>Operations reviewer</h3><ul><li>Does live smoke cover cost cleanup and provider drift?</li></ul>
 
 <h2 id="related">Related ADRs, runbooks, tickets, PRs</h2>

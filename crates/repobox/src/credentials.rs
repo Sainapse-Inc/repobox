@@ -21,18 +21,40 @@ pub enum CredentialSource {
     PermissionLockedFile,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CredentialMethod {
+    BrowserOauth,
+    ServiceToken,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CredentialStatus {
     pub configured: bool,
+    pub method: Option<CredentialMethod>,
     pub source: Option<CredentialSource>,
     pub fallback_path: PathBuf,
     pub warning: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-struct ProviderSecret {
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum ProviderSecret {
+    BrowserOauth { access_token: String },
+    ServiceToken { token_id: String, token: String },
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct LegacyProviderSecret {
     token_id: String,
     token: String,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(untagged)]
+enum StoredProviderSecret {
+    Current(ProviderSecret),
+    Legacy(LegacyProviderSecret),
 }
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
@@ -44,7 +66,7 @@ struct SecretFile {
 }
 
 const fn schema_version() -> u32 {
-    1
+    2
 }
 
 #[derive(Clone, Debug)]
@@ -60,19 +82,22 @@ impl CredentialStore {
     }
 
     pub fn provider_credentials(&self) -> Result<(PlanetScaleCredentials, CredentialSource)> {
-        let token_id = env::var("PLANETSCALE_SERVICE_TOKEN_ID").ok();
-        let token = env::var("PLANETSCALE_SERVICE_TOKEN").ok();
+        let environment_present = env::var_os("PLANETSCALE_SERVICE_TOKEN_ID").is_some()
+            || env::var_os("PLANETSCALE_SERVICE_TOKEN").is_some();
+        let token_id = env::var("PLANETSCALE_SERVICE_TOKEN_ID")
+            .ok()
+            .filter(|value| !value.is_empty());
+        let token = env::var("PLANETSCALE_SERVICE_TOKEN")
+            .ok()
+            .filter(|value| !value.is_empty());
         match (token_id, token) {
             (Some(token_id), Some(token)) if !token_id.is_empty() && !token.is_empty() => {
                 return Ok((
-                    PlanetScaleCredentials {
-                        token_id: SecretString::from(token_id),
-                        token: SecretString::from(token),
-                    },
+                    PlanetScaleCredentials::service_token(token_id, token),
                     CredentialSource::Environment,
                 ));
             }
-            (Some(_), None) | (None, Some(_)) => {
+            _ if environment_present => {
                 return Err(RepoboxError::new(
                     ErrorKind::Authentication,
                     "incomplete_planetscale_environment",
@@ -82,36 +107,34 @@ impl CredentialStore {
             _ => {}
         }
 
+        self.stored_provider_credentials()?.ok_or_else(|| {
+            RepoboxError::new(
+                ErrorKind::Authentication,
+                "planetscale_authentication_required",
+                "PlanetScale credentials are not configured",
+            )
+            .with_suggestion(
+                "Run `repobox auth login`, or set PLANETSCALE_SERVICE_TOKEN_ID and PLANETSCALE_SERVICE_TOKEN.",
+            )
+        })
+    }
+
+    pub fn stored_provider_credentials(
+        &self,
+    ) -> Result<Option<(PlanetScaleCredentials, CredentialSource)>> {
         if let Ok(value) = keyring_get(PROVIDER_KEY) {
             let secret = decode_provider_secret(&value)?;
-            return Ok((secret, CredentialSource::Keyring));
+            return Ok(Some((secret, CredentialSource::Keyring)));
         }
         if let Some(value) = self.read_file()?.items.get(PROVIDER_KEY) {
             let secret = decode_provider_secret(value)?;
-            return Ok((secret, CredentialSource::PermissionLockedFile));
+            return Ok(Some((secret, CredentialSource::PermissionLockedFile)));
         }
-        Err(RepoboxError::new(
-            ErrorKind::Authentication,
-            "planetscale_authentication_required",
-            "PlanetScale credentials are not configured",
-        )
-        .with_suggestion(
-            "Run `repobox auth login`, or set PLANETSCALE_SERVICE_TOKEN_ID and PLANETSCALE_SERVICE_TOKEN.",
-        ))
+        Ok(None)
     }
 
     pub fn store_provider(&self, credentials: &PlanetScaleCredentials) -> Result<CredentialSource> {
-        let value = serde_json::to_string(&ProviderSecret {
-            token_id: credentials.token_id.expose_secret().to_string(),
-            token: credentials.token.expose_secret().to_string(),
-        })
-        .map_err(|error| {
-            RepoboxError::new(
-                ErrorKind::Runtime,
-                "credential_encode_failed",
-                error.to_string(),
-            )
-        })?;
+        let value = encode_provider_secret(credentials)?;
         if keyring_set(PROVIDER_KEY, &value).is_ok() {
             self.remove_file_item(PROVIDER_KEY)?;
             return Ok(CredentialSource::Keyring);
@@ -121,14 +144,26 @@ impl CredentialStore {
     }
 
     pub fn remove_provider(&self) -> Result<()> {
-        let _ = keyring_delete(PROVIDER_KEY);
+        if keyring_get(PROVIDER_KEY).is_ok() {
+            keyring_delete(PROVIDER_KEY).map_err(|error| {
+                RepoboxError::new(
+                    ErrorKind::Runtime,
+                    "credential_delete_failed",
+                    format!(
+                        "could not remove PlanetScale credentials from the OS keyring: {error}"
+                    ),
+                )
+                .with_suggestion("Fix OS keyring access, then rerun `repobox auth logout --yes`.")
+            })?;
+        }
         self.remove_file_item(PROVIDER_KEY)
     }
 
     pub fn status(&self) -> Result<CredentialStatus> {
         match self.provider_credentials() {
-            Ok((_, source)) => Ok(CredentialStatus {
+            Ok((credentials, source)) => Ok(CredentialStatus {
                 configured: true,
+                method: Some(credential_method(&credentials)),
                 source: Some(source),
                 fallback_path: self.fallback_path.clone(),
                 warning: matches!(source, CredentialSource::PermissionLockedFile).then(|| {
@@ -138,6 +173,7 @@ impl CredentialStore {
             }),
             Err(error) if error.kind == ErrorKind::Authentication => Ok(CredentialStatus {
                 configured: false,
+                method: None,
                 source: None,
                 fallback_path: self.fallback_path.clone(),
                 warning: None,
@@ -260,18 +296,54 @@ impl CredentialStore {
     }
 }
 
+fn encode_provider_secret(credentials: &PlanetScaleCredentials) -> Result<String> {
+    let stored = match credentials {
+        PlanetScaleCredentials::AccessToken { token } => ProviderSecret::BrowserOauth {
+            access_token: token.expose_secret().to_owned(),
+        },
+        PlanetScaleCredentials::ServiceToken { token_id, token } => ProviderSecret::ServiceToken {
+            token_id: token_id.expose_secret().to_owned(),
+            token: token.expose_secret().to_owned(),
+        },
+    };
+    serde_json::to_string(&stored).map_err(|error| {
+        RepoboxError::new(
+            ErrorKind::Runtime,
+            "credential_encode_failed",
+            error.to_string(),
+        )
+    })
+}
+
 fn decode_provider_secret(value: &str) -> Result<PlanetScaleCredentials> {
-    let stored: ProviderSecret = serde_json::from_str(value).map_err(|error| {
+    let stored: StoredProviderSecret = serde_json::from_str(value).map_err(|error| {
         RepoboxError::new(
             ErrorKind::Runtime,
             "credential_decode_failed",
             format!("stored provider credential is invalid: {error}"),
         )
     })?;
-    Ok(PlanetScaleCredentials {
-        token_id: SecretString::from(stored.token_id),
-        token: SecretString::from(stored.token),
+    Ok(match stored {
+        StoredProviderSecret::Current(ProviderSecret::BrowserOauth { access_token }) => {
+            PlanetScaleCredentials::AccessToken {
+                token: SecretString::from(access_token),
+            }
+        }
+        StoredProviderSecret::Current(ProviderSecret::ServiceToken { token_id, token })
+        | StoredProviderSecret::Legacy(LegacyProviderSecret { token_id, token }) => {
+            PlanetScaleCredentials::ServiceToken {
+                token_id: SecretString::from(token_id),
+                token: SecretString::from(token),
+            }
+        }
     })
+}
+
+const fn credential_method(credentials: &PlanetScaleCredentials) -> CredentialMethod {
+    match credentials {
+        PlanetScaleCredentials::AccessToken { .. } => CredentialMethod::BrowserOauth,
+        PlanetScaleCredentials::ServiceToken { .. } => CredentialMethod::ServiceToken,
+    }
 }
 
 fn keyring_get(key: &str) -> std::result::Result<String, keyring::Error> {
@@ -318,4 +390,34 @@ fn set_private_permissions(path: &Path) -> Result<()> {
 #[cfg(not(unix))]
 fn set_private_permissions(_path: &Path) -> Result<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn browser_oauth_credentials_round_trip() {
+        let encoded =
+            encode_provider_secret(&PlanetScaleCredentials::access_token("oauth-token")).unwrap();
+        assert!(encoded.contains(r#""kind":"browser_oauth""#));
+        let decoded = decode_provider_secret(&encoded).unwrap();
+        assert_eq!(credential_method(&decoded), CredentialMethod::BrowserOauth);
+        let PlanetScaleCredentials::AccessToken { token } = decoded else {
+            panic!("expected browser OAuth credentials");
+        };
+        assert_eq!(token.expose_secret(), "oauth-token");
+    }
+
+    #[test]
+    fn legacy_service_token_credentials_are_migrated_on_read() {
+        let decoded =
+            decode_provider_secret(r#"{"token_id":"legacy-id","token":"legacy-token"}"#).unwrap();
+        assert_eq!(credential_method(&decoded), CredentialMethod::ServiceToken);
+        let PlanetScaleCredentials::ServiceToken { token_id, token } = decoded else {
+            panic!("expected service-token credentials");
+        };
+        assert_eq!(token_id.expose_secret(), "legacy-id");
+        assert_eq!(token.expose_secret(), "legacy-token");
+    }
 }
