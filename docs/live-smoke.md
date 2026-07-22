@@ -99,7 +99,19 @@ Do not put values in shell history, fixtures, issue text, logs, or `.env` files 
      run --environment smoke/main --yes --json --no-input
    ```
 
-   Expected: stdout is JSONL only, remote Postgres services do not run locally, application services receive valid URLs, and Ctrl-C yields `runtime_stopped` after Compose stops.
+   While the runtime is active, use a second terminal with a conflicting
+   environment variable to verify that the explicit logs selector wins:
+
+   ```sh
+   REPOBOX_ENV=smoke/not-running \
+     target/release/repobox --repo /absolute/path/to/fixture \
+     logs app --environment smoke/main --tail 50 --json --no-input
+   ```
+
+   Expected: stdout is JSONL only, remote Postgres services do not run locally,
+   application services receive valid URLs, the logs command returns events
+   from `smoke/main`, and Ctrl-C yields `runtime_stopped` after Compose
+   stops.
 
 8. Exercise forward-only refresh.
 

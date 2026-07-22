@@ -66,13 +66,16 @@ All help pages include concrete examples. Long prose is available through `repob
 - `--no-input` forbids prompts, browser launch, and TUI entry.
 - `--repo PATH` selects the repository.
 - `--color auto|always|never` controls human stderr styling; `NO_COLOR` always disables it.
-- `--environment NAME` or `REPOBOX_ENV` selects a data environment on relevant commands.
+- `--environment NAME` selects a data environment on relevant commands. It
+  takes precedence over `REPOBOX_ENV`, which takes precedence over the current
+  Git branch.
 
 For non-interactive approved mutation, use all applicable controls:
 
 ```sh
 repobox env create feature/demo --dry-run --json --no-input
 repobox env create feature/demo --yes --json --no-input
+repobox logs app --environment feature/demo --tail 50 --json --no-input
 ```
 
 Structured input resolves as an explicit flag, then piped stdin, then an interactive prompt. For example:
