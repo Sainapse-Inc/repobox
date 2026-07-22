@@ -194,7 +194,7 @@ Repobox is deliberately a local control plane in v0.1. The provider and runtime 
 | `pull` destroys useful environment-local data | High | Medium | Name the destructive effect in help and confirmation, stage before deletion, checkpoint each phase, and never imply rollback exists. |
 | A multi-database operation partially succeeds | Medium | Medium | Preserve successful bindings, mark the environment degraded, keep services stopped during failed pulls, and expose exact resumable job IDs. |
 | Credentials leak through files, argv, or logs | High | Low | Use device approval or environment-only service secrets, keep tokens in keyring or a mode-0600 fallback, inject process env in memory, redact URLs, and test repository outputs. |
-| The shared public PlanetScale CLI OAuth client changes or is restricted | Medium | Low | Pin the reviewed upstream protocol/client provenance, wire-test the flow, retain service-token fallback, and gate release on live browser login. |
+| The shared public PlanetScale CLI OAuth client changes or is restricted | High | Low | Pin the reviewed upstream protocol/client provenance, wire-test the flow, retain service-token fallback, and block a release until Repobox has a dedicated OAuth client or written PlanetScale approval for reuse. |
 | Compose transformation changes application semantics | Medium | Medium | Resolve Compose canonically, change only database services/dependencies/env, keep source files untouched, and cover transforms with fixtures. |
 | Terminal rendering flickers or corrupts the shell | Medium | Low | Use dirty/coalesced presentation, Ratatui diff rendering, synchronized updates, dedicated buffered I/O, and RAII terminal restoration. |
 | Provider API behavior drifts | Medium | Medium | Keep the API behind a trait, classify structured failures, test auth/pagination, and gate release on a live smoke run. |
@@ -235,7 +235,12 @@ Data copy is opt-in through `data.allow_copy: true`. Import streams `pg_dump` di
 
 ## Open questions
 
-Before the first tag, decide whether PlanetScale should issue Repobox a dedicated public OAuth client. The implementation currently follows the official CLI's intentionally non-confidential device client and keeps service-token auth as a fallback. Hosted compute, masking hooks, additional database providers, and periodic source resync remain later-version work.
+The first tag is blocked until Repobox either uses a separately registered
+OAuth client or retains written PlanetScale approval to reuse the official
+CLI's intentionally non-confidential device client. The release workflow
+requires the corresponding auditable repository variable. Service-token auth
+remains the unattended fallback. Hosted compute, masking hooks, additional
+database providers, and periodic source resync remain later-version work.
 
 ## Reviewer prompts
 

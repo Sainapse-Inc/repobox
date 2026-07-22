@@ -1,27 +1,241 @@
 name: Release
 
 on:
-  push:
-    tags: ["v*"]
   workflow_dispatch:
     inputs:
       tag:
         description: Existing v-prefixed tag to publish
         required: true
+      commit:
+        description: Full 40-character commit SHA the tag must resolve to
+        required: true
+
+concurrency:
+  group: repobox-release
+  cancel-in-progress: false
 
 permissions:
-  contents: write
-  id-token: write
-  attestations: write
+  contents: read
 
 env:
   CARGO_TERM_COLOR: always
   REPOBOX_NO_UPDATE_CHECK: "1"
-  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+  RELEASE_TAG: ${{ inputs.tag }}
+  EXPECTED_COMMIT: ${{ inputs.commit }}
 
 jobs:
+  preflight:
+    name: Validate release identity and credentials
+    runs-on: ubuntu-latest
+    outputs:
+      commit: ${{ steps.release.outputs.commit }}
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+    steps:
+      - name: Validate trusted dispatch and input shape
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [[ "$GITHUB_REF" != "refs/heads/main" ]]; then
+            echo "::error::Release workflow must be dispatched from main; received $GITHUB_REF."
+            exit 1
+          fi
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::Stable releases require a plain vX.Y.Z tag; received $RELEASE_TAG."
+            exit 1
+          fi
+          if [[ ! "${EXPECTED_COMMIT,,}" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::The intended release commit must be a full 40-character SHA.'
+            exit 1
+          fi
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (toolchain 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - name: Validate tag, commit, and workspace version
+        id: release
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          tag="$RELEASE_TAG"
+          expected_commit="${EXPECTED_COMMIT,,}"
+          if ! git show-ref --verify --quiet "refs/tags/$tag"; then
+            echo "::error::Release tag $tag does not exist in the repository."
+            exit 1
+          fi
+
+          tag_commit="$(git rev-parse "${tag}^{commit}")"
+          if [[ "$tag_commit" != "$expected_commit" ]]; then
+            echo "::error::Release tag $tag resolves to $tag_commit, not intended commit $expected_commit."
+            exit 1
+          fi
+          if [[ "$(git rev-parse HEAD)" != "$tag_commit" ]]; then
+            echo "::error::Checked-out HEAD does not match release tag $tag."
+            exit 1
+          fi
+          git fetch --force --no-tags origin main:refs/remotes/origin/main
+          if ! git merge-base --is-ancestor "$tag_commit" refs/remotes/origin/main; then
+            echo "::error::Release commit $tag_commit is not reachable from origin/main."
+            exit 1
+          fi
+
+          metadata="$(cargo metadata --locked --no-deps --format-version 1)"
+          mapfile -t versions < <(
+            jq -r '.workspace_members[] as $member | .packages[] | select(.id == $member) | .version' \
+              <<<"$metadata" | sort -u
+          )
+          if [[ "${#versions[@]}" -ne 1 ]]; then
+            echo "::error::All workspace packages must have one release version; found: ${versions[*]}"
+            exit 1
+          fi
+
+          version="${versions[0]}"
+          expected_tag="v$version"
+          if [[ "$tag" != "$expected_tag" ]]; then
+            echo "::error::Release tag must be $expected_tag for workspace version $version; received $tag."
+            exit 1
+          fi
+          if ! awk -v heading="## [$version] - " '
+            index($0, heading) == 1 && $0 ~ / - [0-9]{4}-[0-9]{2}-[0-9]{2}$/ { found = 1 }
+            END { exit !found }
+          ' CHANGELOG.md; then
+            echo "::error::CHANGELOG.md must contain a dated '## [$version] - YYYY-MM-DD' heading."
+            exit 1
+          fi
+
+          {
+            echo "commit=$tag_commit"
+            echo "tag=$tag"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+          echo "Validated $tag at $tag_commit for workspace version $version."
+      - name: Validate PlanetScale OAuth release approval
+        shell: bash
+        env:
+          PLANETSCALE_OAUTH_RELEASE_MODE: ${{ vars.PLANETSCALE_OAUTH_RELEASE_MODE }}
+        run: |
+          set -euo pipefail
+
+          case "$PLANETSCALE_OAUTH_RELEASE_MODE" in
+            dedicated_client)
+              echo 'OAuth release mode: dedicated Repobox client.'
+              ;;
+            planetscale_approved)
+              echo 'OAuth release mode: PlanetScale-approved public CLI client use.'
+              ;;
+            *)
+              echo '::error::PLANETSCALE_OAUTH_RELEASE_MODE must be dedicated_client or planetscale_approved.'
+              exit 1
+              ;;
+          esac
+      - name: Validate required publication credentials
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [[ -z "$CARGO_REGISTRY_TOKEN" ]]; then
+            echo '::error::CARGO_REGISTRY_TOKEN is required for a release.'
+            exit 1
+          fi
+          if [[ -z "$HOMEBREW_TAP_TOKEN" ]]; then
+            echo '::error::HOMEBREW_TAP_TOKEN is required for a release.'
+            exit 1
+          fi
+      - name: Validate publishable workspace packages
+        run: cargo package --workspace --locked --no-verify
+
+  quality:
+    name: Release quality and contracts
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (toolchain 1.97.1)
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - name: Install release validation tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes jq shellcheck
+          go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+      - name: Check documentation
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: cargo doc --workspace --no-deps --locked
+      - name: Audit shell scripts and workflows
+        shell: bash
+        run: |
+          set -euo pipefail
+          shellcheck scripts/*.sh
+          actionlint="$(go env GOPATH)/bin/actionlint"
+          "$actionlint" -shellcheck 'shellcheck --shell=bash --severity=warning'
+      - name: Audit help surface
+        run: scripts/audit-help.sh
+      - name: Regenerate public schemas
+        run: scripts/generate-schemas.sh
+      - name: Reject schema drift
+        run: git diff --exit-code -- docs/schemas
+
+  macos-tests:
+    name: Release macOS tests
+    needs: preflight
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (toolchain 1.97.1)
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
+      - run: cargo test --workspace --all-targets --locked
+
+  dependency-audit:
+    name: Release dependency audit
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: rustsec/audit-check@69366f33c96575abad1ee0dba8212993eecbe998 # v2 branch
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  secret-scan:
+    name: Release secret scan
+    needs: preflight
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
   build:
     name: Build ${{ matrix.target }}
+    needs: preflight
     strategy:
       fail-fast: false
       matrix:
@@ -36,14 +250,14 @@ jobs:
             target: aarch64-apple-darwin
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
-      - uses: dtolnay/rust-toolchain@master
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (toolchain 1.97.1)
         with:
           toolchain: 1.97.1
           targets: ${{ matrix.target }}
-      - uses: Swatinem/rust-cache@v2
+      - uses: Swatinem/rust-cache@e18b497796c12c097a38f9edb9d0641fb99eee32 # v2
         with:
           key: ${{ matrix.target }}
       - run: cargo build --release --locked --target ${{ matrix.target }} --package repobox
@@ -56,91 +270,821 @@ jobs:
           cp "target/${{ matrix.target }}/release/repobox" "$archive/"
           cp README.md LICENSE CHANGELOG.md "$archive/"
           tar -czf "$archive.tar.gz" "$archive"
-      - uses: actions/upload-artifact@v7
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: repobox-${{ matrix.target }}
           path: repobox-*.tar.gz
           if-no-files-found: error
 
-  github-release:
-    name: Checksums, attestations, and GitHub release
-    needs: build
+  release-assets:
+    name: Validate and checksum release assets
+    needs: [preflight, build]
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/download-artifact@v8
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
         with:
           path: dist
           merge-multiple: true
-      - name: Generate checksums
+      - name: Validate archives and generate checksums
         working-directory: dist
-        run: sha256sum repobox-*.tar.gz > SHA256SUMS
-      - uses: actions/attest-build-provenance@v4
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          expected=(
+            "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-x86_64-apple-darwin.tar.gz"
+            "repobox-$tag-aarch64-apple-darwin.tar.gz"
+          )
+
+          shopt -s nullglob
+          actual=(repobox-*.tar.gz)
+          if [[ "${#actual[@]}" -ne "${#expected[@]}" ]]; then
+            echo "::error::Expected ${#expected[@]} release archives, found ${#actual[@]}."
+            exit 1
+          fi
+          for archive in "${expected[@]}"; do
+            if [[ ! -f "$archive" ]]; then
+              echo "::error::Missing release archive $archive."
+              exit 1
+            fi
+            tar -tzf "$archive" >/dev/null
+          done
+
+          sha256sum "${expected[@]}" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+          jq -n \
+            --arg tag "${{ needs.preflight.outputs.tag }}" \
+            --arg commit "${{ needs.preflight.outputs.commit }}" \
+            --arg version "${{ needs.preflight.outputs.version }}" \
+            --rawfile checksums SHA256SUMS \
+            '{
+              schema_version: 1,
+              tag: $tag,
+              commit: $commit,
+              version: $version,
+              sha256sums: ($checksums | split("\n") | map(select(length > 0)))
+            }' > RELEASE-MANIFEST.json
+          jq -e \
+            --arg commit "${{ needs.preflight.outputs.commit }}" \
+            '.schema_version == 1 and .commit == $commit and (.sha256sums | length == 4)' \
+            RELEASE-MANIFEST.json >/dev/null
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
-          subject-path: dist/*
-      - uses: softprops/action-gh-release@v3
-        with:
-          tag_name: ${{ env.RELEASE_TAG }}
-          generate_release_notes: true
-          fail_on_unmatched_files: true
-          files: |
+          name: release-assets
+          path: |
             dist/repobox-*.tar.gz
             dist/SHA256SUMS
+            dist/RELEASE-MANIFEST.json
+          if-no-files-found: error
+          retention-days: 7
+
+  release-stage:
+    name: Stage or validate GitHub release
+    needs:
+      - preflight
+      - release-assets
+      - quality
+      - macos-tests
+      - dependency-audit
+      - secret-scan
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      contents: write
+    outputs:
+      reuse: ${{ steps.release-state.outputs.reuse }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Revalidate protected tag
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/$RELEASE_TAG:refs/tags/$RELEASE_TAG"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_commit" != "${{ needs.preflight.outputs.commit }}" ]]; then
+            echo "::error::Release tag $RELEASE_TAG moved to $tag_commit after preflight."
+            exit 1
+          fi
+      - name: Reject Homebrew downgrade
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          response="$(mktemp)"
+          formula="$(mktemp)"
+          trap 'rm -f "$response" "$formula"' EXIT
+          status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --header "Authorization: Bearer $HOMEBREW_TAP_TOKEN" --header 'Accept: application/vnd.github+json' --user-agent "repobox-release/${GITHUB_RUN_ID}" "https://api.github.com/repos/abhirupghosh/homebrew-tap/contents/Formula/repobox.rb")"
+          case "$status" in
+            200)
+              jq -er '.content' "$response" | base64 --decode > "$formula"
+              current="$(sed -nE 's/^[[:space:]]*version "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$formula" | head -n 1)"
+              incoming="${{ needs.preflight.outputs.version }}"
+              if [[ -z "$current" ]]; then
+                echo '::error::Could not read the current Homebrew formula version.'
+                exit 1
+              fi
+              oldest="$(printf '%s\n%s\n' "$current" "$incoming" | sort -V | head -n 1)"
+              if [[ "$incoming" != "$current" && "$oldest" == "$incoming" ]]; then
+                echo "::error::Release $incoming would downgrade the Homebrew formula from $current."
+                exit 1
+              fi
+              ;;
+            404)
+              echo 'No existing Homebrew formula; this is a new-formula release.'
+              ;;
+            *)
+              echo "::error::GitHub returned HTTP $status while reading the Homebrew formula."
+              exit 1
+              ;;
+          esac
+      - name: Inspect remote release state
+        id: release-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          commit="${{ needs.preflight.outputs.commit }}"
+          version="${{ needs.preflight.outputs.version }}"
+          marker="<!-- repobox-release:v1 commit=$commit version=$version -->"
+          pages="$(mktemp)"
+          matches="$(mktemp)"
+          release="$(mktemp)"
+          expected_names="$(mktemp)"
+          actual_names="$(mktemp)"
+          published_dir="$(mktemp -d)"
+          trap 'rm -f "$pages" "$matches" "$release" "$expected_names" "$actual_names"; rm -rf "$published_dir"' EXIT
+
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages"
+          jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]' "$pages" > "$matches"
+          count="$(jq 'length' "$matches")"
+          if [[ "$count" -gt 1 ]]; then
+            echo "::error::More than one GitHub release uses tag $tag."
+            exit 1
+          fi
+          if [[ "$count" -eq 0 ]]; then
+            echo 'reuse=false' >> "$GITHUB_OUTPUT"
+            echo "No existing GitHub release for $tag; a draft will be staged."
+            exit 0
+          fi
+
+          jq '.[0]' "$matches" > "$release"
+          if [[ "$(jq -r '.prerelease' "$release")" != false ]]; then
+            echo "::error::Stable tag $tag is attached to a prerelease."
+            exit 1
+          fi
+          body="$(jq -r '.body // ""' "$release")"
+          if [[ "$body" != *"$marker"* ]]; then
+            echo "::error::Release $tag is not owned by this commit-bound Repobox workflow."
+            exit 1
+          fi
+
+          expected=(
+            RELEASE-MANIFEST.json
+            SHA256SUMS
+            "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-x86_64-apple-darwin.tar.gz"
+            "repobox-$tag-aarch64-apple-darwin.tar.gz"
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$expected_names"
+          jq -r '.assets[].name' "$release" | sort > "$actual_names"
+
+          if [[ "$(jq -r '.draft' "$release")" == true ]]; then
+            while IFS= read -r asset_id; do
+              gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id"
+            done < <(jq -r '.assets[].id' "$release")
+            echo 'reuse=false' >> "$GITHUB_OUTPUT"
+            echo "Matching workflow-owned draft found for $tag; replacing its complete asset set."
+            exit 0
+          fi
+
+          cmp --silent "$expected_names" "$actual_names" || {
+            echo "::error::Published release $tag does not contain the exact expected asset set."
+            exit 1
+          }
+          while IFS=$'\t' read -r name asset_id; do
+            gh api --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$published_dir/$name"
+          done < <(jq -r '.assets[] | [.name, (.id | tostring)] | @tsv' "$release")
+          scripts/validate-release-assets.sh "$published_dir" "$tag" "$commit" "$version"
+          echo 'reuse=true' >> "$GITHUB_OUTPUT"
+          echo "Published release $tag is complete and authoritative."
+      - uses: actions/attest-build-provenance@0f67c3f4856b2e3261c31976d6725780e5e4c373 # v4.1.1
+        if: steps.release-state.outputs.reuse != 'true'
+        with:
+          subject-path: dist/repobox-*.tar.gz
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        if: steps.release-state.outputs.reuse != 'true'
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          target_commitish: ${{ needs.preflight.outputs.commit }}
+          body: |
+            <!-- repobox-release:v1 commit=${{ needs.preflight.outputs.commit }} version=${{ needs.preflight.outputs.version }} -->
+          generate_release_notes: true
+          draft: true
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/RELEASE-MANIFEST.json
+            dist/repobox-*.tar.gz
+            dist/SHA256SUMS
+      - name: Validate staged draft
+        if: steps.release-state.outputs.reuse != 'true'
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          commit="${{ needs.preflight.outputs.commit }}"
+          version="${{ needs.preflight.outputs.version }}"
+          marker="<!-- repobox-release:v1 commit=$commit version=$version -->"
+          pages="$(mktemp)"
+          matches="$(mktemp)"
+          release="$(mktemp)"
+          expected_names="$(mktemp)"
+          actual_names="$(mktemp)"
+          staged_dir="$(mktemp -d)"
+          trap 'rm -f "$pages" "$matches" "$release" "$expected_names" "$actual_names"; rm -rf "$staged_dir"' EXIT
+
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages"
+          jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]' "$pages" > "$matches"
+          if [[ "$(jq 'length' "$matches")" -ne 1 ]]; then
+            echo "::error::Expected exactly one staged release for $tag."
+            exit 1
+          fi
+          jq '.[0]' "$matches" > "$release"
+          body="$(jq -r '.body // ""' "$release")"
+          if [[ "$(jq -r '.draft' "$release")" != true || "$(jq -r '.prerelease' "$release")" != false || "$body" != *"$marker"* ]]; then
+            echo "::error::Staged release identity or draft state is invalid."
+            exit 1
+          fi
+
+          expected=(
+            RELEASE-MANIFEST.json
+            SHA256SUMS
+            "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-x86_64-apple-darwin.tar.gz"
+            "repobox-$tag-aarch64-apple-darwin.tar.gz"
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$expected_names"
+          jq -r '.assets[].name' "$release" | sort > "$actual_names"
+          cmp --silent "$expected_names" "$actual_names" || {
+            echo '::error::Staged draft does not contain the exact expected asset set.'
+            exit 1
+          }
+          while IFS=$'\t' read -r name asset_id; do
+            gh api --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$staged_dir/$name"
+          done < <(jq -r '.assets[] | [.name, (.id | tostring)] | @tsv' "$release")
+          scripts/validate-release-assets.sh "$staged_dir" "$tag" "$commit" "$version"
 
   crates-io:
     name: Publish crates.io packages
-    needs: github-release
+    needs:
+      - preflight
+      - release-stage
     runs-on: ubuntu-latest
     env:
-      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+      RELEASE_VERSION: ${{ needs.preflight.outputs.version }}
     steps:
-      - uses: actions/checkout@v7
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: ${{ env.RELEASE_TAG }}
-      - uses: dtolnay/rust-toolchain@master
+          ref: ${{ needs.preflight.outputs.commit }}
+      - uses: dtolnay/rust-toolchain@2c7215f132e9ebf062739d9130488b56d53c060c # master (toolchain 1.97.1)
         with:
           toolchain: 1.97.1
-      - name: Publish workspace in dependency order
-        if: env.CARGO_REGISTRY_TOKEN != ''
+      - name: Package exact crates.io artifacts
         shell: bash
         run: |
           set -euo pipefail
-          cargo publish --locked --package repobox-core
-          sleep 30
-          cargo publish --locked --package repobox-provider-planetscale
-          cargo publish --locked --package repobox-runtime-compose
-          sleep 30
-          cargo publish --locked --package repobox
-      - name: Report missing token
-        if: env.CARGO_REGISTRY_TOKEN == ''
-        run: echo 'CARGO_REGISTRY_TOKEN is unset; crates.io publication was skipped.'
+          cargo package --workspace --locked --no-verify
+          version="$RELEASE_VERSION"
+          artifacts=(
+            "target/package/repobox-core-$version.crate"
+            "target/package/repobox-provider-planetscale-$version.crate"
+            "target/package/repobox-runtime-compose-$version.crate"
+            "target/package/repobox-$version.crate"
+          )
+          for artifact in "${artifacts[@]}"; do
+            if [[ ! -f "$artifact" ]]; then
+              echo "::error::Missing packaged crate $artifact."
+              exit 1
+            fi
+          done
+          sha256sum "${artifacts[@]}" > target/package/RELEASE-CRATE-SHA256SUMS
+          sha256sum --check target/package/RELEASE-CRATE-SHA256SUMS
+      - name: Publish workspace in dependency order
+        shell: bash
+        env:
+          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${CARGO_REGISTRY_TOKEN:?CARGO_REGISTRY_TOKEN passed preflight but is now missing}"
+
+          tag="${{ needs.preflight.outputs.tag }}"
+          commit="${{ needs.preflight.outputs.commit }}"
+          version="${{ needs.preflight.outputs.version }}"
+          marker="<!-- repobox-release:v1 commit=$commit version=$version -->"
+          pages="$(mktemp)"
+          matches="$(mktemp)"
+          response_file="$(mktemp)"
+          trap 'rm -f "$pages" "$matches" "$response_file"' EXIT
+
+          git fetch --force origin "refs/tags/$tag:refs/tags/$tag"
+          tag_commit="$(git rev-parse "${tag}^{commit}")"
+          if [[ "$tag_commit" != "$commit" ]]; then
+            echo "::error::Release tag $tag moved to $tag_commit immediately before crates.io publication."
+            exit 1
+          fi
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages"
+          jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]' "$pages" > "$matches"
+          if [[ "$(jq 'length' "$matches")" -ne 1 ]]; then
+            echo "::error::Expected exactly one staged or published release for $tag."
+            exit 1
+          fi
+          body="$(jq -r '.[0].body // ""' "$matches")"
+          if [[ "$(jq -r '.[0].prerelease' "$matches")" != false || "$body" != *"$marker"* ]]; then
+            echo '::error::Release identity changed before crates.io publication.'
+            exit 1
+          fi
+          expected_draft=true
+          if [[ "${{ needs.release-stage.outputs.reuse }}" == true ]]; then
+            expected_draft=false
+          fi
+          if [[ "$(jq -r '.[0].draft' "$matches")" != "$expected_draft" ]]; then
+            echo '::error::Release draft state changed before crates.io publication.'
+            exit 1
+          fi
+
+          local_crate_checksum() {
+            local crate="$1"
+            local version="$2"
+            local filename="target/package/$crate-$version.crate"
+            local count
+            local checksum
+            count="$(awk -v filename="$filename" '$2 == filename { count++ } END { print count + 0 }' \
+              target/package/RELEASE-CRATE-SHA256SUMS)"
+            checksum="$(awk -v filename="$filename" '$2 == filename { print $1 }' \
+              target/package/RELEASE-CRATE-SHA256SUMS)"
+            if [[ "$count" -ne 1 || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Expected one local checksum for $filename." >&2
+              return 2
+            fi
+            printf '%s' "$checksum"
+          }
+
+          crate_version_exists() {
+            local crate="$1"
+            local version="$2"
+            local status
+            status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+              --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/abhirupghosh/repobox)" \
+              "https://crates.io/api/v1/crates/$crate/$version")" || {
+              echo "::error::Could not query crates.io for $crate $version."
+              return 2
+            }
+            case "$status" in
+              200) return 0 ;;
+              404) return 1 ;;
+              *)
+                echo "::error::crates.io returned HTTP $status while checking $crate $version."
+                return 2
+                ;;
+            esac
+          }
+
+          assert_registry_checksum_matches() {
+            local crate="$1"
+            local version="$2"
+            local local_checksum
+            local registry_checksum
+            local_checksum="$(local_crate_checksum "$crate" "$version")" || return $?
+            registry_checksum="$(jq -er \
+              --arg crate "$crate" \
+              --arg version "$version" \
+              '.version
+                | select(.crate == $crate and .num == $version and .yanked == false)
+                | .checksum
+                | strings
+                | select(test("^[0-9a-f]{64}$"))' \
+              "$response_file")" || {
+                echo "::error::crates.io returned no valid non-yanked checksum for $crate $version."
+                return 2
+              }
+            if [[ "$registry_checksum" != "$local_checksum" ]]; then
+              echo "::error::Published $crate $version checksum does not match the pinned local package."
+              echo "::error::Local: $local_checksum; crates.io: $registry_checksum"
+              return 1
+            fi
+            echo "$crate $version matches local package checksum $local_checksum."
+          }
+
+          wait_until_registry_matches() {
+            local crate="$1"
+            local version="$2"
+            local attempt
+            local lookup_status
+            for attempt in {1..30}; do
+              if crate_version_exists "$crate" "$version"; then
+                assert_registry_checksum_matches "$crate" "$version" || return $?
+                return 0
+              else
+                lookup_status=$?
+              fi
+              if [[ "$lookup_status" -ne 1 ]]; then
+                return "$lookup_status"
+              fi
+              echo "Waiting for crates.io API to expose $crate $version ($attempt/30)..."
+              sleep 10
+            done
+            echo "::error::$crate $version did not become visible through the crates.io API."
+            return 1
+          }
+
+          wait_until_indexed() {
+            local crate="$1"
+            local version="$2"
+            local attempt
+            for attempt in {1..30}; do
+              if cargo info --quiet --registry crates-io "$crate@$version" >/dev/null 2>&1; then
+                echo "$crate $version is visible in the crates.io index."
+                return 0
+              fi
+              echo "Waiting for crates.io to index $crate $version ($attempt/30)..."
+              sleep 10
+            done
+            echo "::error::$crate $version was published but did not become visible in the crates.io index."
+            return 1
+          }
+
+          publish_one() {
+            local package="$1"
+            local version="$2"
+            local lookup_status
+            local publish_status
+
+            if crate_version_exists "$package" "$version"; then
+              assert_registry_checksum_matches "$package" "$version" || return $?
+              echo "$package $version is already published with the exact local checksum; skipping."
+            else
+              lookup_status=$?
+              if [[ "$lookup_status" -ne 1 ]]; then
+                return "$lookup_status"
+              fi
+
+              if cargo publish --locked --package "$package"; then
+                echo "Published $package $version."
+                wait_until_registry_matches "$package" "$version"
+              else
+                publish_status=$?
+                if crate_version_exists "$package" "$version"; then
+                  assert_registry_checksum_matches "$package" "$version" || return $?
+                  echo "$package $version appeared with the exact local checksum; treating it as a concurrent success."
+                else
+                  lookup_status=$?
+                  if [[ "$lookup_status" -eq 1 ]]; then
+                    echo "::error::Publishing $package $version failed and that exact version is still absent."
+                  else
+                    echo "::error::Publishing $package $version failed and its registry state could not be verified."
+                  fi
+                  return "$publish_status"
+                fi
+              fi
+            fi
+
+            wait_until_indexed "$package" "$version"
+          }
+
+          packages=(
+            repobox-core
+            repobox-provider-planetscale
+            repobox-runtime-compose
+            repobox
+          )
+          for package in "${packages[@]}"; do
+            if crate_version_exists "$package" "$RELEASE_VERSION"; then
+              assert_registry_checksum_matches "$package" "$RELEASE_VERSION" || exit $?
+            else
+              lookup_status=$?
+              if [[ "$lookup_status" -eq 1 ]]; then
+                echo "$package $RELEASE_VERSION is absent and will be published."
+              else
+                exit "$lookup_status"
+              fi
+            fi
+          done
+
+          for package in "${packages[@]}"; do
+            publish_one "$package" "$RELEASE_VERSION"
+          done
+
+  github-release:
+    name: Publish GitHub release
+    needs: [preflight, release-assets, release-stage, crates-io]
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      attestations: write
+      artifact-metadata: write
+      contents: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          ref: ${{ needs.preflight.outputs.commit }}
+      - name: Revalidate tag before publishing
+        shell: bash
+        run: |
+          set -euo pipefail
+          git fetch --force origin "refs/tags/${RELEASE_TAG}:refs/tags/${RELEASE_TAG}"
+          tag_commit="$(git rev-parse "${RELEASE_TAG}^{commit}")"
+          if [[ "$tag_commit" != "${{ needs.preflight.outputs.commit }}" ]]; then
+            echo "::error::Release tag $RELEASE_TAG moved to $tag_commit after preflight."
+            exit 1
+          fi
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+      - name: Guard existing release identity
+        id: release-state
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          response_file="$(mktemp)"
+          published_dir="$(mktemp -d)"
+          trap 'rm -f "$response_file"; rm -rf "$published_dir"' EXIT
+
+          status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
+            --header "Authorization: Bearer $GH_TOKEN" \
+            --header 'Accept: application/vnd.github+json' \
+            --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/abhirupghosh/repobox)" \
+            "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag")" || {
+              echo "::error::Could not query GitHub release state for $tag."
+              exit 1
+            }
+
+          case "$status" in
+            200)
+              marker="<!-- repobox-release:v1 commit=${{ needs.preflight.outputs.commit }} version=${{ needs.preflight.outputs.version }} -->"
+              body="$(jq -r '.body // ""' "$response_file")"
+              if [[ "$(jq -r '.draft' "$response_file")" != false || "$(jq -r '.prerelease' "$response_file")" != false || "$body" != *"$marker"* ]]; then
+                echo "::error::Published release $tag no longer has the expected workflow identity."
+                exit 1
+              fi
+              if ! gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --pattern RELEASE-MANIFEST.json --dir "$published_dir"; then
+                echo "::error::Existing release $tag has no downloadable RELEASE-MANIFEST.json; refusing overwrite."
+                exit 1
+              fi
+              if ! jq -e \
+                --arg tag "$tag" \
+                --arg commit "${{ needs.preflight.outputs.commit }}" \
+                --arg version "${{ needs.preflight.outputs.version }}" \
+                '.schema_version == 1
+                  and .tag == $tag
+                  and .commit == $commit
+                  and .version == $version
+                  and (.sha256sums | type == "array" and length == 4)' \
+                "$published_dir/RELEASE-MANIFEST.json" >/dev/null; then
+                echo "::error::Existing release $tag belongs to a different tag, commit, or version."
+                exit 1
+              fi
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --pattern SHA256SUMS --dir "$published_dir"
+              gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+                --pattern 'repobox-*.tar.gz' --dir "$published_dir"
+              (
+                cd "$published_dir"
+                expected=(
+                  "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+                  "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+                  "repobox-$tag-x86_64-apple-darwin.tar.gz"
+                  "repobox-$tag-aarch64-apple-darwin.tar.gz"
+                )
+                shopt -s nullglob
+                actual=(repobox-*.tar.gz)
+                if [[ "${#actual[@]}" -ne "${#expected[@]}" ]]; then
+                  echo "::error::Existing release $tag does not contain exactly four archives."
+                  exit 1
+                fi
+                for archive in "${expected[@]}"; do
+                  [[ -f "$archive" ]] || {
+                    echo "::error::Existing release $tag is missing $archive."
+                    exit 1
+                  }
+                  count="$(awk -v filename="$archive" '$2 == filename { count++ } END { print count + 0 }' SHA256SUMS)"
+                  checksum="$(awk -v filename="$archive" '$2 == filename { print $1 }' SHA256SUMS)"
+                  if [[ "$count" -ne 1 || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+                    echo "::error::Existing release $tag has an invalid checksum entry for $archive."
+                    exit 1
+                  fi
+                done
+                jq -r '.sha256sums[]' RELEASE-MANIFEST.json > MANIFEST-SHA256SUMS
+                cmp --silent SHA256SUMS MANIFEST-SHA256SUMS || {
+                  echo "::error::Existing release checksum file differs from its manifest."
+                  exit 1
+                }
+                sha256sum --check SHA256SUMS
+              )
+              echo "reuse=true" >> "$GITHUB_OUTPUT"
+              echo "Existing release assets match ${{ needs.preflight.outputs.commit }}; reusing them."
+              ;;
+            404)
+              echo "reuse=false" >> "$GITHUB_OUTPUT"
+              echo "No existing GitHub release for $tag."
+              ;;
+            *)
+              echo "::error::GitHub returned HTTP $status while checking release $tag."
+              exit 1
+              ;;
+          esac
+      - uses: softprops/action-gh-release@3d0d9888cb7fd7b750713d6e236d1fcb99157228 # v3.0.2
+        if: steps.release-state.outputs.reuse != 'true'
+        with:
+          tag_name: ${{ needs.preflight.outputs.tag }}
+          target_commitish: ${{ needs.preflight.outputs.commit }}
+          body: |
+            <!-- repobox-release:v1 commit=${{ needs.preflight.outputs.commit }} version=${{ needs.preflight.outputs.version }} -->
+          generate_release_notes: true
+          draft: false
+          fail_on_unmatched_files: true
+          overwrite_files: false
+          files: |
+            dist/RELEASE-MANIFEST.json
+            dist/repobox-*.tar.gz
+            dist/SHA256SUMS
+      - name: Validate published release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          commit="${{ needs.preflight.outputs.commit }}"
+          version="${{ needs.preflight.outputs.version }}"
+          marker="<!-- repobox-release:v1 commit=$commit version=$version -->"
+          pages="$(mktemp)"
+          matches="$(mktemp)"
+          release="$(mktemp)"
+          expected_names="$(mktemp)"
+          actual_names="$(mktemp)"
+          published_dir="$(mktemp -d)"
+          trap 'rm -f "$pages" "$matches" "$release" "$expected_names" "$actual_names"; rm -rf "$published_dir"' EXIT
+
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/releases?per_page=100" > "$pages"
+          jq --arg tag "$tag" '[.[][] | select(.tag_name == $tag)]' "$pages" > "$matches"
+          if [[ "$(jq 'length' "$matches")" -ne 1 ]]; then
+            echo "::error::Expected exactly one published release for $tag."
+            exit 1
+          fi
+          jq '.[0]' "$matches" > "$release"
+          body="$(jq -r '.body // ""' "$release")"
+          if [[ "$(jq -r '.draft' "$release")" != false || "$(jq -r '.prerelease' "$release")" != false || "$body" != *"$marker"* ]]; then
+            echo '::error::Final GitHub release identity or publication state is invalid.'
+            exit 1
+          fi
+          expected=(
+            RELEASE-MANIFEST.json
+            SHA256SUMS
+            "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-x86_64-apple-darwin.tar.gz"
+            "repobox-$tag-aarch64-apple-darwin.tar.gz"
+          )
+          printf '%s\n' "${expected[@]}" | sort > "$expected_names"
+          jq -r '.assets[].name' "$release" | sort > "$actual_names"
+          cmp --silent "$expected_names" "$actual_names" || {
+            echo '::error::Final GitHub release does not contain the exact expected asset set.'
+            exit 1
+          }
+          while IFS=$'\t' read -r name asset_id; do
+            gh api --header 'Accept: application/octet-stream' "repos/$GITHUB_REPOSITORY/releases/assets/$asset_id" > "$published_dir/$name"
+          done < <(jq -r '.assets[] | [.name, (.id | tostring)] | @tsv' "$release")
+          scripts/validate-release-assets.sh "$published_dir" "$tag" "$commit" "$version"
 
   homebrew:
-    name: Update Homebrew tap
-    needs: github-release
-    runs-on: ubuntu-latest
+    name: Audit, test, and update Homebrew tap
+    needs: [preflight, github-release]
+    runs-on: macos-15
     env:
-      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+      HOMEBREW_NO_AUTO_UPDATE: "1"
     steps:
-      - name: Update formula from release checksums
-        if: env.GH_TOKEN != ''
+      - name: Download canonical GitHub release assets
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag="${{ needs.preflight.outputs.tag }}"
+          mkdir dist
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern RELEASE-MANIFEST.json --dir dist
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern SHA256SUMS --dir dist
+          gh release download "$tag" --repo "$GITHUB_REPOSITORY" \
+            --pattern 'repobox-*.tar.gz' --dir dist
+      - name: Generate, audit, install, and test formula
         shell: bash
         run: |
           set -euo pipefail
-          tag="$RELEASE_TAG"
-          version="${tag#v}"
-          gh repo clone abhirupghosh/homebrew-tap tap
-          cd tap
-          mkdir -p Formula
-          curl --fail --silent --show-error --location \
-            "https://github.com/abhirupghosh/repobox/releases/download/$tag/SHA256SUMS" \
-            --output SHA256SUMS
-          sha_linux_x86=$(awk '/x86_64-unknown-linux-gnu/ {print $1}' SHA256SUMS)
-          sha_linux_arm=$(awk '/aarch64-unknown-linux-gnu/ {print $1}' SHA256SUMS)
-          sha_macos_x86=$(awk '/x86_64-apple-darwin/ {print $1}' SHA256SUMS)
-          sha_macos_arm=$(awk '/aarch64-apple-darwin/ {print $1}' SHA256SUMS)
-          ruby - "$tag" "$version" "$sha_linux_x86" "$sha_linux_arm" "$sha_macos_x86" "$sha_macos_arm" <<'RUBY'
-          tag, version, linux_x86, linux_arm, macos_x86, macos_arm = ARGV
-          File.write("Formula/repobox.rb", <<~FORMULA)
+
+          tag="${{ needs.preflight.outputs.tag }}"
+          version="${{ needs.preflight.outputs.version }}"
+          jq -e \
+            --arg tag "$tag" \
+            --arg commit "${{ needs.preflight.outputs.commit }}" \
+            --arg version "$version" \
+            '.schema_version == 1
+              and .tag == $tag
+              and .commit == $commit
+              and .version == $version
+              and (.sha256sums | type == "array" and length == 4)' \
+            dist/RELEASE-MANIFEST.json >/dev/null
+          jq -r '.sha256sums[]' dist/RELEASE-MANIFEST.json > dist/MANIFEST-SHA256SUMS
+          cmp --silent dist/SHA256SUMS dist/MANIFEST-SHA256SUMS
+          expected=(
+            "repobox-$tag-x86_64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-aarch64-unknown-linux-gnu.tar.gz"
+            "repobox-$tag-x86_64-apple-darwin.tar.gz"
+            "repobox-$tag-aarch64-apple-darwin.tar.gz"
+          )
+          shopt -s nullglob
+          actual=(dist/repobox-*.tar.gz)
+          if [[ "${#actual[@]}" -ne "${#expected[@]}" ]]; then
+            echo "::error::Canonical release must contain exactly four archives."
+            exit 1
+          fi
+          for archive in "${expected[@]}"; do
+            if [[ ! -f "dist/$archive" ]]; then
+              echo "::error::Canonical release is missing $archive."
+              exit 1
+            fi
+            count="$(awk -v filename="$archive" '$2 == filename { count++ } END { print count + 0 }' dist/SHA256SUMS)"
+            checksum="$(awk -v filename="$archive" '$2 == filename { print $1 }' dist/SHA256SUMS)"
+            if [[ "$count" -ne 1 || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Canonical release has an invalid checksum entry for $archive."
+              exit 1
+            fi
+          done
+          (cd dist && shasum -a 256 --check SHA256SUMS)
+
+          brew tap abhirupghosh/tap https://github.com/abhirupghosh/homebrew-tap
+          tap_dir="$(brew --repository abhirupghosh/tap)"
+          formula="$tap_dir/Formula/repobox.rb"
+          formula_is_new=false
+          if [[ ! -f "$formula" ]]; then
+            formula_is_new=true
+          else
+            current_version="$(sed -nE 's/^[[:space:]]*version "([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' "$formula" | head -n 1)"
+            if [[ -z "$current_version" ]]; then
+              echo '::error::Could not read the current Homebrew formula version.'
+              exit 1
+            fi
+            brew ruby -- -e 'require "rubygems/version"; abort("incoming Homebrew version would be a downgrade") if Gem::Version.new(ARGV[0]) < Gem::Version.new(ARGV[1])' "$version" "$current_version"
+          fi
+          mkdir -p "$(dirname "$formula")"
+
+          checksum_for() {
+            local target="$1"
+            local filename="repobox-$tag-$target.tar.gz"
+            local count
+            local checksum
+            count="$(awk -v filename="$filename" '$2 == filename { count++ } END { print count + 0 }' dist/SHA256SUMS)"
+            checksum="$(awk -v filename="$filename" '$2 == filename { print $1 }' dist/SHA256SUMS)"
+            if [[ "$count" -ne 1 || ! "$checksum" =~ ^[0-9a-f]{64}$ ]]; then
+              echo "::error::Expected exactly one valid checksum for $filename."
+              exit 1
+            fi
+            printf '%s' "$checksum"
+          }
+
+          sha_linux_x86="$(checksum_for x86_64-unknown-linux-gnu)"
+          sha_linux_arm="$(checksum_for aarch64-unknown-linux-gnu)"
+          sha_macos_x86="$(checksum_for x86_64-apple-darwin)"
+          sha_macos_arm="$(checksum_for aarch64-apple-darwin)"
+
+          brew ruby -- - "$formula" "$tag" "$version" "$sha_linux_x86" "$sha_linux_arm" "$sha_macos_x86" "$sha_macos_arm" <<'RUBY'
+          formula, tag, version, linux_x86, linux_arm, macos_x86, macos_arm = ARGV
+          File.write(formula, <<~FORMULA)
             class Repobox < Formula
               desc "Agent-native persistent development environments"
               homepage "https://github.com/abhirupghosh/repobox"
@@ -172,17 +1116,42 @@ jobs:
               end
 
               test do
-                assert_match version.to_s, shell_output("#{bin}/repobox --version")
+                assert_match version.to_s, shell_output("\#{bin}/repobox --version")
               end
             end
           FORMULA
           RUBY
-          rm SHA256SUMS
+
+          brew ruby -- -c "$formula"
+          brew style --formula "$formula"
+          if [[ "$formula_is_new" == true ]]; then
+            brew audit --new --formula "$formula"
+          else
+            brew audit --strict --online --formula "$formula"
+          fi
+          brew install --formula abhirupghosh/tap/repobox
+          brew test abhirupghosh/tap/repobox
+
+      - name: Push tested formula
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          set -euo pipefail
+          : "${GH_TOKEN:?HOMEBREW_TAP_TOKEN passed preflight but is now missing}"
+
+          tag="${{ needs.preflight.outputs.tag }}"
+          tap_dir="$(brew --repository abhirupghosh/tap)"
+          cd "$tap_dir"
+          git add Formula/repobox.rb
+          if git diff --cached --quiet; then
+            echo "Homebrew formula is already current for $tag; no tap push is needed."
+            exit 0
+          fi
+
+          git diff --cached --check
           git config user.name github-actions[bot]
           git config user.email 41898282+github-actions[bot]@users.noreply.github.com
-          git add Formula/repobox.rb
           git commit -m "repobox $tag"
-          git push
-      - name: Report missing token
-        if: env.GH_TOKEN == ''
-        run: echo 'HOMEBREW_TAP_TOKEN is unset; tap update was skipped.'
+          gh auth setup-git
+          git push origin HEAD

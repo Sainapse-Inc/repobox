@@ -94,7 +94,12 @@ Import requires `data.allow_copy: true`, creates no dump file, and does no maski
 
 ## Project status
 
-The offline v0.1 implementation and test suite are complete. A first public tag remains gated on the credentialed [live PlanetScale smoke](docs/live-smoke.md); no release should be published until every created provider resource is verified and cleaned up.
+The offline v0.1 implementation and test suite are complete. A credentialed
+PlanetScale diagnostic run completed with full cleanup and exposed recovery
+defects that are now covered by the release candidate. A first public tag
+remains gated on rerunning the complete [live PlanetScale
+smoke](docs/live-smoke.md) from that candidate, resolving the OAuth-client
+authorization decision, and configuring publication credentials.
 
 Hosted application execution on Modal, E2B, or similar providers is a planned runtime adapter, not a v0.1 claim. The initial architecture keeps that seam without adding a daemon or hosted control plane.
 

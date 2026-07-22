@@ -16,3 +16,21 @@ All notable changes to Repobox will be documented here.
 - Versioned JSON/JSONL envelopes, schema snapshots, mutation undo metadata, stable exits, recursive agent-context manifest, and concrete help examples for every command.
 - Linux/macOS x86_64/arm64 CI and release workflows, checksums, attestations, crates.io publication, and Homebrew tap automation.
 - Architecture, configuration, agent-contract, feature-specification, security, and live-provider-smoke documentation.
+
+### Changed
+
+- Extended provider readiness budgets to tolerate observed PlanetScale
+  transitions and reuse pending databases and branches during exact job resume.
+- Hardened the manual release workflow with immutable action references,
+  commit-bound manifests, publication preflight checks, crate checksum
+  verification, and auditable OAuth-client authorization.
+
+### Fixed
+
+- Resume the explicitly requested create or pull job instead of selecting a
+  newer operation for the same environment.
+- Preserve canonical role identity across pull, avoid rotating roles after
+  credential-read failures, and make credential deletion retry-safe across
+  keyring and permission-restricted fallback storage.
+- Require confirmation before resuming mutating jobs and retain successful
+  bindings when another database service fails.

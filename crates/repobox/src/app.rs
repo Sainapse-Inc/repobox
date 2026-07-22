@@ -588,7 +588,7 @@ async fn logs(
 ) -> Result<()> {
     let context = ProjectContext::load(repository)?;
     let environment = context.environment(None).await?;
-    let variables = available_runtime_variables(&context, &environment);
+    let variables = available_runtime_variables(&context, &environment)?;
     let runtime = compose_runtime(&context, &environment, &BTreeMap::new()).await?;
     let child = runtime.spawn_logs(service, follow, tail)?;
     stream_log_child(
@@ -1265,45 +1265,59 @@ async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand
                 ));
             }
             let step_prefix = match job.kind {
-                JobKind::EnvironmentCreate => Some("provision:"),
-                JobKind::EnvironmentPull => Some("refresh:"),
-                _ => None,
+                JobKind::EnvironmentCreate => "provision:",
+                JobKind::EnvironmentPull => "refresh:",
+                _ => {
+                    return Err(RepoboxError::new(
+                        ErrorKind::Conflict,
+                        "job_resume_unsupported",
+                        "this job kind cannot yet be resumed by the current command",
+                    ));
+                }
             };
-            let selected_services = step_prefix.map_or_else(BTreeSet::new, |prefix| {
-                job.steps
-                    .iter()
-                    .filter_map(|step| step.name.strip_prefix(prefix).map(str::to_owned))
-                    .collect()
-            });
+            let selected_services = job
+                .steps
+                .iter()
+                .filter_map(|step| step.name.strip_prefix(step_prefix).map(str::to_owned))
+                .collect();
             let options = ProvisionOptions {
                 create_backup: target.create_backup,
                 wait_for_backup: target.wait,
                 selected_services,
             };
+            confirm(
+                cli,
+                &format!(
+                    "Resume durable job {} for environment `{}`? This may create billable resources or replace environment data.",
+                    job.id, job.environment
+                ),
+            )?;
+            let credentials = credential_store(&context.paths);
+            let provider = if cli.dry_run {
+                planning_provider()?
+            } else {
+                provider(&credentials)?
+            };
+            let mut manager = EnvironmentManager::new(
+                &context.config,
+                &context.repository,
+                &provider,
+                &credentials,
+                state_store(&context.config, &context.paths),
+                store,
+                output,
+            );
             match job.kind {
                 JobKind::EnvironmentCreate => {
-                    let credentials = credential_store(&context.paths);
-                    let provider = if cli.dry_run {
-                        planning_provider()?
-                    } else {
-                        provider(&credentials)?
-                    };
-                    let mut manager = EnvironmentManager::new(
-                        &context.config,
-                        &context.repository,
-                        &provider,
-                        &credentials,
-                        state_store(&context.config, &context.paths),
-                        store,
-                        output,
-                    );
                     if cli.dry_run {
                         output.data(
                             "job resume",
                             &manager.create_plan(&job.environment, &options)?,
                         )
                     } else {
-                        let mutation = manager.ensure(&job.environment, &options).await?;
+                        let mutation = manager
+                            .resume_create(job.id, &job.environment, &options)
+                            .await?;
                         let undo = Some(format!("repobox env delete {} --yes", job.environment));
                         if output.json() {
                             output.stream_mutation(&mutation, undo, None)
@@ -1319,12 +1333,6 @@ async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand
                     }
                 }
                 JobKind::EnvironmentPull => {
-                    let credentials = credential_store(&context.paths);
-                    let provider = if cli.dry_run {
-                        planning_provider()?
-                    } else {
-                        provider(&credentials)?
-                    };
                     let mut restart = false;
                     if matches!(context.config.runtime, RuntimeConfig::Compose { .. })
                         && !cli.dry_run
@@ -1340,22 +1348,15 @@ async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand
                             }
                         }
                     }
-                    let mut manager = EnvironmentManager::new(
-                        &context.config,
-                        &context.repository,
-                        &provider,
-                        &credentials,
-                        state_store(&context.config, &context.paths),
-                        store,
-                        output,
-                    );
                     if cli.dry_run {
                         output.data(
                             "job resume",
                             &manager.pull_plan(&job.environment, &options)?,
                         )
                     } else {
-                        let mutation = manager.pull(&job.environment, &options).await?;
+                        let mutation = manager
+                            .resume_pull(job.id, &job.environment, &options)
+                            .await?;
                         if restart {
                             let state = state_store(&context.config, &context.paths)
                                 .load(context.config.project.id)?;
@@ -1387,11 +1388,7 @@ async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand
                         }
                     }
                 }
-                _ => Err(RepoboxError::new(
-                    ErrorKind::Conflict,
-                    "job_resume_unsupported",
-                    "this job kind cannot yet be resumed by the current command",
-                )),
+                _ => unreachable!("unsupported job kinds returned before manager setup"),
             }
         }
     }
@@ -1955,7 +1952,8 @@ async fn compose_runtime(
             "this command requires the Compose runtime",
         ));
     };
-    let mut global_environment = available_runtime_variables(context, environment);
+    let mut global_environment =
+        compose_runtime_variables(available_runtime_variables(context, environment))?;
     global_environment.extend(variables.clone());
     let detection = detect_configuration(
         &context.repository,
@@ -2000,14 +1998,26 @@ async fn compose_runtime(
 fn available_runtime_variables(
     context: &ProjectContext,
     environment: &str,
-) -> BTreeMap<String, String> {
+) -> Result<BTreeMap<String, String>> {
     let credentials = credential_store(&context.paths);
-    state_store(&context.config, &context.paths)
-        .load(context.config.project.id)
-        .ok()
-        .and_then(|state| state.environments.get(environment).cloned())
-        .map(|record| stored_environment_variables(&context.config, &record, &credentials))
-        .unwrap_or_default()
+    let state = state_store(&context.config, &context.paths).load(context.config.project.id)?;
+    let Some(record) = state.environments.get(environment) else {
+        return Ok(BTreeMap::new());
+    };
+    stored_environment_variables(&context.config, record, &credentials)
+}
+
+fn compose_runtime_variables(
+    variables: Result<BTreeMap<String, String>>,
+) -> Result<BTreeMap<String, String>> {
+    match variables {
+        Ok(variables) => Ok(variables),
+        // Stop and status must remain usable when a desktop keyring is
+        // temporarily unavailable. Log streaming performs a strict lookup
+        // first so exact known values can still be added to its redactor.
+        Err(error) if error.code == "credential_read_failed" => Ok(BTreeMap::new()),
+        Err(error) => Err(error),
+    }
 }
 
 fn runtime_redactor(
@@ -2149,7 +2159,11 @@ fn read_telemetry(path: &Path) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::AuthPending;
+    use std::collections::BTreeMap;
+
+    use repobox_core::{ErrorKind, RepoboxError};
+
+    use super::{AuthPending, compose_runtime_variables};
 
     #[test]
     fn auth_pending_contains_only_public_handoff_values() {
@@ -2179,6 +2193,31 @@ mod tests {
                 "user_code",
                 "verification_url",
             ]
+        );
+    }
+
+    #[test]
+    fn compose_recovery_only_suppresses_keyring_read_failures() {
+        let keyring_error = RepoboxError::new(
+            ErrorKind::Runtime,
+            "credential_read_failed",
+            "keyring unavailable",
+        );
+        assert_eq!(
+            compose_runtime_variables(Err(keyring_error)).unwrap(),
+            BTreeMap::new()
+        );
+
+        let decode_error = RepoboxError::new(
+            ErrorKind::Runtime,
+            "credential_decode_failed",
+            "malformed credential",
+        );
+        assert_eq!(
+            compose_runtime_variables(Err(decode_error))
+                .unwrap_err()
+                .code,
+            "credential_decode_failed"
         );
     }
 }

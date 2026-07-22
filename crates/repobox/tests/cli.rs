@@ -2,10 +2,13 @@
 
 use std::fs;
 use std::os::unix::fs::PermissionsExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use repobox_core::config::RepoboxConfig;
+use repobox_core::jobs::{JobKind, JobRecord, JobStatus, JobStore};
+use repobox_core::paths::RepoboxPaths;
 
 fn fake_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
@@ -41,6 +44,69 @@ fn command(repository: &Path) -> Command {
     );
     command.current_dir(repository).env("PATH", path);
     command
+}
+
+fn isolated_command(repository: &Path) -> Command {
+    let mut command = command(repository);
+    let home = repository.join(".test-home");
+    command
+        .env("HOME", &home)
+        .env("XDG_CONFIG_HOME", repository.join(".test-xdg/config"))
+        .env("XDG_STATE_HOME", repository.join(".test-xdg/state"))
+        .env("XDG_CACHE_HOME", repository.join(".test-xdg/cache"))
+        .env("REPOBOX_NO_UPDATE_CHECK", "1")
+        .env_remove("PLANETSCALE_SERVICE_TOKEN_ID")
+        .env_remove("PLANETSCALE_SERVICE_TOKEN");
+    command
+}
+
+fn isolated_paths(repository: &Path) -> RepoboxPaths {
+    #[cfg(target_os = "macos")]
+    {
+        let home = repository.join(".test-home");
+        let support = home
+            .join("Library/Application Support")
+            .join("dev.abhirupghosh.repobox");
+        return RepoboxPaths {
+            config_dir: support.clone(),
+            state_dir: support,
+            cache_dir: home.join("Library/Caches").join("dev.abhirupghosh.repobox"),
+        };
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    RepoboxPaths {
+        config_dir: repository.join(".test-xdg/config/repobox"),
+        state_dir: repository.join(".test-xdg/state/repobox"),
+        cache_dir: repository.join(".test-xdg/cache/repobox"),
+    }
+}
+
+fn repository_with_resumable_job(kind: JobKind) -> (tempfile::TempDir, JobRecord, PathBuf) {
+    let repository = fake_repository();
+    isolated_command(repository.path())
+        .args([
+            "init",
+            "--organization",
+            "acme",
+            "--yes",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success();
+
+    let config = RepoboxConfig::load(&repository.path().join(".repobox.yml")).unwrap();
+    let step = match kind {
+        JobKind::EnvironmentCreate => "provision:db",
+        JobKind::EnvironmentPull => "refresh:db",
+        _ => panic!("fixture only supports resumable environment jobs"),
+    };
+    let mut job = JobRecord::new(kind, config.project.id, "feature/resume-contract", [step]);
+    job.status = JobStatus::Degraded;
+    let ledger = isolated_paths(repository.path()).jobs(config.project.id);
+    JobStore::new(&ledger).append(&job).unwrap();
+    (repository, job, ledger)
 }
 
 #[test]
@@ -188,6 +254,95 @@ fn environment_dry_run_needs_no_provider_credentials() {
     );
     let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(value["data"]["operation"], "environment_create");
+}
+
+#[test]
+fn job_resume_requires_structured_confirmation_before_provider_access() {
+    let (repository, job, ledger) = repository_with_resumable_job(JobKind::EnvironmentCreate);
+    let before = fs::read(&ledger).unwrap();
+    let output = isolated_command(repository.path())
+        .args(["job", "resume", &job.id.to_string(), "--json", "--no-input"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stdout.is_empty());
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["kind"], "usage");
+    assert_eq!(error["error"]["code"], "confirmation_required");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&job.id.to_string())
+    );
+    assert_eq!(fs::read(&ledger).unwrap(), before);
+}
+
+#[test]
+fn pull_job_resume_requires_confirmation_before_runtime_or_provider_access() {
+    let (repository, job, ledger) = repository_with_resumable_job(JobKind::EnvironmentPull);
+    let before = fs::read(&ledger).unwrap();
+    let output = isolated_command(repository.path())
+        .args(["job", "resume", &job.id.to_string(), "--json", "--no-input"])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "confirmation_required");
+    assert_eq!(fs::read(&ledger).unwrap(), before);
+}
+
+#[test]
+fn job_resume_yes_satisfies_the_confirmation_gate() {
+    let (repository, job, ledger) = repository_with_resumable_job(JobKind::EnvironmentCreate);
+    let before = fs::read(&ledger).unwrap();
+    let output = isolated_command(repository.path())
+        .env("PLANETSCALE_SERVICE_TOKEN_ID", "test-id")
+        .args([
+            "job",
+            "resume",
+            &job.id.to_string(),
+            "--yes",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(4));
+    let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
+    assert_eq!(error["error"]["code"], "incomplete_planetscale_environment");
+    assert_eq!(fs::read(&ledger).unwrap(), before);
+}
+
+#[test]
+fn job_resume_dry_run_needs_no_confirmation_or_provider_credentials() {
+    let (repository, job, ledger) = repository_with_resumable_job(JobKind::EnvironmentCreate);
+    let before = fs::read(&ledger).unwrap();
+    let output = isolated_command(repository.path())
+        .args([
+            "job",
+            "resume",
+            &job.id.to_string(),
+            "--dry-run",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["command"], "job resume");
+    assert_eq!(value["data"]["operation"], "environment_create");
+    assert_eq!(value["data"]["environment"], job.environment);
+    assert_eq!(fs::read(&ledger).unwrap(), before);
 }
 
 #[test]

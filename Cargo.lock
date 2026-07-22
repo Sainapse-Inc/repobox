@@ -2719,6 +2719,7 @@ name = "repobox"
 version = "0.1.0"
 dependencies = [
  "assert_cmd",
+ "async-trait",
  "chrono",
  "clap",
  "clap_complete",
