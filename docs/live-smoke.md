@@ -79,6 +79,10 @@ Do not put values in shell history, fixtures, issue text, logs, or `.env` files 
 
    Expected: dry-run makes no API mutation. Create returns a ready environment, one binding per database, a succeeded job, and an undo command.
 
+   PlanetScale database, backup, and branch transitions can each take several minutes. A
+   healthy operation may remain pending for more than ten minutes; let Repobox's readiness
+   budget expire or inspect the durable job before treating a quiet transition as failure.
+
 6. Verify idempotence.
 
    ```sh
@@ -149,3 +153,42 @@ Never automate broad organization deletion from this runbook.
 ## Release evidence
 
 Record the Repobox commit, Rust version, Docker Compose version, provider organization (not credentials), timestamps, command exits, job IDs, request IDs, created resource IDs, cleanup confirmation, and any provider behavior that differed from the mocked wire tests.
+
+### Diagnostic run: 2026-07-22
+
+This run exercised the pre-release build at commit
+`4ffe5c9306332e37aaa91b4ff1f30b69ba1af546`. It is diagnostic evidence, not a
+passing release gate.
+
+- Toolchain: Rust/Cargo 1.97.1, Docker 29.5.1, Docker Compose v5.1.3, and
+  Repobox 0.1.0.
+- Scope: the personal PlanetScale organization `abhirup-ghosh`; the `sainapse`
+  organization was not selected or mutated.
+- Fixture: project `repobox-live-smoke-oxka1s`, project ID
+  `14094572-c57f-492d-84e6-001fe9dd1513`, database
+  `repobox-live-smoke-oxka1s-db`, and environment `smoke/main`.
+- Initial create job `019f885e-71d6-7d52-a7d8-5c624df1d9b2` resumed after a
+  billing-verification response (`9d449a14-f35b-4d52-aa4e-2eb776860f58`). The
+  database became ready in about 8.5 minutes. Backup `irnl7rylgwhd` completed
+  in about 5.3 minutes, and canonical branch `coil9acn68ac` became ready in
+  about 8.3 minutes. The resumed job succeeded on attempt two.
+- Idempotence job `019f88c6-6013-7393-b267-6925ddaf71c2` reused the canonical
+  branch and role. `repobox run` skipped the local PostgreSQL service, started
+  only the local application service, injected nonempty database URLs, and
+  stopped it cleanly on Ctrl-C without printing credentials.
+- Pull job `019f88c8-b967-76d2-bed1-90e7ea70c68a` created staging branch
+  `32immzta0xve`. The branch took about 11.9 minutes to become ready, exceeding
+  the then-hard-coded ten-minute readiness budget. Resuming the exact job
+  completed the forward-only swap, leaving one canonical environment branch.
+- Partial-failure job `019f88d8-5d93-7683-b4c3-69984683625a` retained the
+  successful `db` binding and reported the failing service plus provider
+  request ID `14000b44-be75-472f-8672-2ea6dd0384ef`. A subsequent create found
+  that pull had used a staging-derived role identity and created a second role.
+- Cleanup job `019f88da-5e4f-7250-9b34-ba9630c66991` deleted the environment.
+  The exact smoke database was then deleted explicitly. Final provider checks
+  showed no databases in `abhirup-ghosh`, and Docker showed no smoke container.
+
+Verdict: **failed release gate**. Before tagging, Repobox must tolerate observed
+provider readiness times, reuse pending resources during resume, preserve a
+canonical role identity across pull, enforce confirmation on job resume, and
+pass this live lifecycle again from the release candidate commit.
