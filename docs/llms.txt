@@ -1,0 +1,15 @@
+# Repobox Documentation
+
+> Repobox is an agent-native, terminal-only development environment platform. Its first release keeps application processes local and moves PostgreSQL into persistent branch-scoped PlanetScale environments.
+
+## Initiative
+
+- [Branch-scoped development data](/docs/features/branch-scoped-data.md): v0.1 feature specification, behavior, architecture, risk, security, rollout, and test contract.
+
+## Reference
+
+- [Architecture](/docs/architecture.md): crate boundaries, create/pull state machines, Compose and secret boundaries, TUI kernel, and hosted runtime seam.
+- [Configuration](/docs/configuration.md): strict `.repobox.yml` fields, bootstrapping, agent guides, and resolution.
+- [Agent contract](/docs/agent-contract.md): command grammar, JSON/JSONL, errors, exits, auth, jobs, and compatibility.
+- [Live smoke](/docs/live-smoke.md): release-gating PlanetScale validation and cleanup procedure.
+- [CLI audit](/docs/cli-audit.md): tier-3 agent-native CLI rubric and executed evidence.

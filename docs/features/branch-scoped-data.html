@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Branch-scoped development data — Repobox feature spec</title>
+<link rel="stylesheet" href="../_assets/style.css">
+</head>
+<body>
+<nav class="topbar"><div class="inner"><a href="../index.html" class="brand">Repobox Docs</a><span class="crumbs"><span class="sep">›</span><a href="../index.html">Home</a><span class="sep">›</span> Branch-scoped data</span></div></nav>
+
+<header class="hero"><div class="inner">
+  <div><span class="pill">FEATURE SPEC</span><span class="pill pill-blue">IMPLEMENTING</span></div>
+  <h1>Branch-scoped development data</h1>
+  <p class="subtitle">Repobox gives every local Git branch persistent remote PostgreSQL data while application processes remain local. The first implementation uses PlanetScale and Docker Compose through a terminal-only Rust CLI that is equally operable by humans and agents.</p>
+  <div class="meta"><span>Owner: repobox-maintainers</span><span class="sep">·</span><span>Last reviewed 2026-07-22</span><span class="sep">·</span><span>Review due 2026-10-20</span><span class="sep">·</span><a href="branch-scoped-data.md">Markdown view</a></div>
+</div></header>
+
+<div class="layout">
+<aside class="sidebar"><h3>Contents</h3><ul>
+  <li><a href="#summary">Summary</a></li><li><a href="#decision">Decision required</a></li><li><a href="#problem">Problem and user need</a></li><li><a href="#current">Current behavior</a></li><li><a href="#proposed">Proposed behavior</a></li><li><a href="#capabilities">Affected capabilities</a></li><li><a href="#systems">Affected systems</a></li><li><a href="#api">API and data model</a></li><li><a href="#architecture">Architecture</a></li><li><a href="#alternatives">Alternatives</a></li><li><a href="#risks">Risks</a></li><li><a href="#rollout">Rollout</a></li><li><a href="#tests">Test plan</a></li><li><a href="#observability">Operations</a></li><li><a href="#security">Security</a></li><li><a href="#open">Open questions</a></li><li><a href="#reviewers">Reviewer prompts</a></li><li><a href="#related">Related</a></li>
+</ul></aside>
+
+<main>
+<div class="callout"><strong>Decision required:</strong> Confirm that v0.1 should ship the local control-plane architecture, PlanetScale-only PostgreSQL provider, forward-only pull semantics, and versioned agent CLI contract before the first tagged release.</div>
+
+<h2 id="summary">Summary</h2>
+<p><code>repobox run</code> loads or detects a repository, provisions isolated remote PostgreSQL data for the Git environment, injects credentials into local processes, and presents logs in a fast terminal UI. Provider mutations are checkpointed, while automation receives versioned JSON or JSONL.</p>
+
+<h2 id="decision">Decision required</h2>
+<p>Confirm the v0.1 boundaries above. Hosted compute, additional providers, masking hooks, and periodic source resync remain later work.</p>
+
+<h2 id="problem">Problem and user need</h2>
+<p>Databases consume local disk and memory, are slow to reconstruct, and are commonly shared accidentally across branches. Repositories also lack a standard, secret-safe way to tell humans and agents how to acquire the correct durable development data.</p>
+
+<h2 id="current">Current behavior</h2>
+<p>Each repository invents its own Compose lifecycle, environment-file convention, and database copy scripts. Branches usually share mutable data, secrets leak into local files, and failed provider work has no durable recovery handle.</p>
+
+<h2 id="proposed">Proposed behavior</h2>
+<ol><li>Detect every Compose PostgreSQL service and create strict project configuration plus managed agent-guide blocks.</li><li>Map the selected Git environment, including <code>main</code>, to deterministic PlanetScale branches.</li><li>Store one-time role credentials outside the repository and inject URLs only into child-process environments.</li><li>Remove remote database services from an in-memory Compose model and pass transient YAML over stdin.</li><li>Stage and checkpoint forward-only refreshes so partial failures can resume without guessing.</li><li>Require confirmation for destructive or billable work and expose dry-run, JSON, and JSONL forms.</li></ol>
+
+<h2 id="capabilities">Affected capabilities</h2>
+<ul><li>Branch-scoped development data</li><li>Agent-native dev environments</li><li>Local runtime orchestration</li><li>Durable provider operations</li></ul>
+
+<h2 id="systems">Affected systems and components</h2>
+<table><thead><tr><th>System</th><th>Component</th><th>Impact</th></tr></thead><tbody>
+<tr><td><code>repobox-cli</code></td><td>CLI and TUI</td><td>Human and agent command surface plus event-driven terminal rendering.</td></tr>
+<tr><td><code>repobox-core</code></td><td>Config, identity, state, jobs</td><td>Strict contracts, atomic state, deterministic names, and durable operations.</td></tr>
+<tr><td><code>planetscale-api</code></td><td>Provider adapter</td><td>Database, backup, branch, role, retry, pagination, and request-ID handling.</td></tr>
+<tr><td><code>docker-compose</code></td><td>Runtime adapter</td><td>Postgres detection and repository-preserving transient transforms.</td></tr>
+</tbody></table>
+
+<h2 id="api">API and data model changes</h2>
+<pre><code>repobox agent-context --schemas --json
+
+success:  { schema_version, command, data }
+mutation: { ...resource, undo_command, undo_reason }
+stream:   { schema_version, sequence, timestamp, event, data }
+error:    { schema_version, error: { kind, code, message, ... } }</code></pre>
+<p>The project input is a strict version-1 <code>.repobox.yml</code>. Unknown keys fail validation, while secrets remain outside both project configuration and durable state.</p>
+
+<h2 id="architecture">Architecture diagrams</h2>
+<div class="diagram" role="img" aria-label="Repobox C4 context: developer and agent use the Repobox CLI, which reads the repository, calls PlanetScale, invokes Docker Compose, and stores credentials in the OS keyring.">
+<svg viewBox="0 0 940 330" xmlns="http://www.w3.org/2000/svg">
+  <defs><style>.b{fill:#151c25;stroke:#3d5368;stroke-width:2}.p{fill:#112b39;stroke:#63d6ff;stroke-width:2}.t{fill:#e8edf3;font:16px system-ui}.s{fill:#9ba9ba;font:13px system-ui}.a{stroke:#72e0a8;stroke-width:2;marker-end:url(#m)} </style><marker id="m" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="7" markerHeight="7" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#72e0a8"/></marker></defs>
+  <rect class="b" x="20" y="35" width="180" height="80" rx="10"/><text class="t" x="45" y="70">Developer</text><text class="s" x="45" y="94">terminal</text>
+  <rect class="b" x="20" y="210" width="180" height="80" rx="10"/><text class="t" x="45" y="245">LLM agent</text><text class="s" x="45" y="269">JSON / JSONL</text>
+  <rect class="p" x="340" y="122" width="230" height="90" rx="12"/><text class="t" x="385" y="160">Repobox CLI</text><text class="s" x="385" y="186">local control plane</text>
+  <rect class="b" x="710" y="20" width="200" height="70" rx="10"/><text class="t" x="742" y="52">PlanetScale</text><text class="s" x="742" y="74">remote Postgres</text>
+  <rect class="b" x="710" y="130" width="200" height="70" rx="10"/><text class="t" x="742" y="162">Docker Compose</text><text class="s" x="742" y="184">local processes</text>
+  <rect class="b" x="710" y="240" width="200" height="70" rx="10"/><text class="t" x="742" y="272">OS keyring</text><text class="s" x="742" y="294">provider credentials</text>
+  <line class="a" x1="200" y1="77" x2="340" y2="148"/><line class="a" x1="200" y1="250" x2="340" y2="187"/><line class="a" x1="570" y1="150" x2="710" y2="58"/><line class="a" x1="570" y1="167" x2="710" y2="165"/><line class="a" x1="570" y1="187" x2="710" y2="273"/>
+</svg></div>
+<p>Inside Repobox, the CLI coordinates core state, the environment manager, the provider adapter, the Compose adapter, the credential store, and the event-driven TUI. Provider and runtime traits are the seam for later E2B or Modal execution.</p>
+
+<h2 id="alternatives">Alternatives considered</h2>
+<ol><li><strong>Go</strong> — faster compiles, but Rust better fits one safe low-overhead binary and explicit state machines.</li><li><strong>Local-only Compose</strong> — does not deliver persistent isolated data.</li><li><strong>Always-on daemon</strong> — adds lifecycle and security complexity too early.</li><li><strong>Edit Compose or .env</strong> — leaks secrets and takes ownership of user files.</li><li><strong>Terraform UX</strong> — mismatched to a fast branch-by-branch loop and log surface.</li></ol>
+
+<h2 id="risks">Risks and mitigations</h2>
+<table><thead><tr><th>Risk</th><th>Severity</th><th>Likelihood</th><th>Mitigation</th></tr></thead><tbody>
+<tr><td>Unexpected branch cost</td><td>High</td><td>Medium</td><td>Confirmation, dry-run plan, smallest SKU, explicit prune.</td></tr>
+<tr><td>Destructive pull</td><td>High</td><td>Medium</td><td>Staging, explicit warning, phase checkpoints, no false rollback claim.</td></tr>
+<tr><td>Partial multi-database work</td><td>Medium</td><td>Medium</td><td>Degraded state, preserved successes, resumable job ID.</td></tr>
+<tr><td>Credential leakage</td><td>High</td><td>Low</td><td>No secret flags/files; keyring, process env, redaction, tests.</td></tr>
+</tbody></table>
+
+<h2 id="rollout">Rollout and migration plan</h2>
+<ol><li>Land implementation, schemas, docs, and CI without a tag.</li><li>Verify offline on Linux and macOS.</li><li>Run the credentialed provider smoke and clean every resource.</li><li>Tag v0.1.0 and publish checksummed, attested artifacts, crates, and Homebrew formula.</li></ol>
+<h3>Rollback plan</h3><p>Before release, revert the bootstrap. After release, deprecate the affected release and publish a patch. Remote environments are only deleted by an explicit <code>repobox env delete NAME --yes</code>. Interrupted pulls resume forward; deleted old branch data has no rollback.</p>
+
+<h2 id="tests">Test plan</h2>
+<ul><li>Unit tests for config, identity, state, jobs, redaction, guides, Compose, and TUI coalescing.</li><li>Provider wire tests for authentication, pagination, and permission errors.</li><li>Black-box tests for help, structured errors, detection/init, dry-run, and schemas.</li><li>Release-gating live smoke for create, rerun, run, pull, interruption, degraded state, delete, and cleanup.</li></ul>
+
+<h2 id="observability">Observability and operations</h2>
+<p>Atomic project state and append-only jobs record bindings, steps, failures, and timestamps. Status, service status, job view, and doctor commands expose that state; request IDs appear on provider failures. v0.1 sends no telemetry events.</p>
+
+<h2 id="security">Security and privacy review</h2>
+<p>Tokens are entered through a hidden prompt or environment variable and never accepted as secret flags. Role URLs stay in the OS credential store or a permission-restricted explicit fallback. Local import is opt-in, streams without a dump file, and performs no masking, so users remain responsible for source-data classification.</p>
+
+<h2 id="open">Open questions</h2>
+<p>None — v0.1 choices were resolved before implementation. Hosted compute and periodic resync are later-version work.</p>
+
+<h2 id="reviewers">Reviewer prompts</h2>
+<h3>Architecture reviewer</h3><ul><li>Does the provider/runtime boundary preserve the hosted-compute path?</li><li>Can every pull failure phase resume without guessing?</li></ul>
+<h3>API reviewer</h3><ul><li>Are structured contracts additive and sufficient for LLM recovery?</li></ul>
+<h3>Security reviewer</h3><ul><li>Can any secret reach argv, project files, diagnostics, or jobs?</li></ul>
+<h3>Operations reviewer</h3><ul><li>Does live smoke cover cost cleanup and provider drift?</li></ul>
+
+<h2 id="related">Related ADRs, runbooks, tickets, PRs</h2>
+<ul><li><a href="../architecture.md">Architecture</a></li><li><a href="../agent-contract.md">Agent contract</a></li><li><a href="../configuration.md">Configuration</a></li><li><a href="../live-smoke.md">Live provider smoke</a></li><li>ADRs, tickets, and PRs: none for the repository bootstrap.</li></ul>
+
+<details><summary>Appendix: terminal rendering</summary><p>The TUI applies reducer-owned state, dirty/coalesced presentation, one frame in flight, synchronized updates, dedicated buffered output, dedicated input, and a paint cap without an always-running timer. It uses upstream Ratatui and does not copy Grok Build's inline-terminal fork.</p></details>
+</main></div>
+<footer>Repobox Docs — 2026-07-22</footer>
+</body>
+</html>

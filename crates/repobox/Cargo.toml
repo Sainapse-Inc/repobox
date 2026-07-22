@@ -1,0 +1,49 @@
+[package]
+name = "repobox"
+description = "Agent-native, terminal-only persistent development environments"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../../README.md"
+keywords = ["development", "postgresql", "docker", "tui", "cli"]
+categories = ["command-line-utilities", "development-tools"]
+
+[[bin]]
+name = "repobox"
+path = "src/main.rs"
+
+[dependencies]
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+crossbeam-channel.workspace = true
+crossterm.workspace = true
+hex.workspace = true
+keyring.workspace = true
+ratatui.workspace = true
+repobox-core = { path = "../repobox-core", version = "0.1.0" }
+repobox-provider-planetscale = { path = "../repobox-provider-planetscale", version = "0.1.0" }
+repobox-runtime-compose = { path = "../repobox-runtime-compose", version = "0.1.0" }
+reqwest.workspace = true
+rpassword.workspace = true
+schemars.workspace = true
+secrecy.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+url.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+assert_cmd = "2"
+predicates = "3"
+tempfile.workspace = true
+
+[lints]
+workspace = true

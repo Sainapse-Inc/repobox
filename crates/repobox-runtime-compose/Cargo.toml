@@ -1,0 +1,25 @@
+[package]
+name = "repobox-runtime-compose"
+description = "Docker Compose detection and local runtime adapter for Repobox"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+[dependencies]
+async-trait.workspace = true
+repobox-core = { path = "../repobox-core", version = "0.1.0" }
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml_ng.workspace = true
+sha2.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

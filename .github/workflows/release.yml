@@ -1,0 +1,188 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing v-prefixed tag to publish
+        required: true
+
+permissions:
+  contents: write
+  id-token: write
+  attestations: write
+
+env:
+  CARGO_TERM_COLOR: always
+  REPOBOX_NO_UPDATE_CHECK: "1"
+  RELEASE_TAG: ${{ github.event_name == 'push' && github.ref_name || inputs.tag }}
+
+jobs:
+  build:
+    name: Build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
+          - os: macos-15
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          targets: ${{ matrix.target }}
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: cargo build --release --locked --target ${{ matrix.target }} --package repobox
+      - name: Assemble archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          archive="repobox-${RELEASE_TAG}-${{ matrix.target }}"
+          mkdir "$archive"
+          cp "target/${{ matrix.target }}/release/repobox" "$archive/"
+          cp README.md LICENSE CHANGELOG.md "$archive/"
+          tar -czf "$archive.tar.gz" "$archive"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: repobox-${{ matrix.target }}
+          path: repobox-*.tar.gz
+          if-no-files-found: error
+
+  github-release:
+    name: Checksums, attestations, and GitHub release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum repobox-*.tar.gz > SHA256SUMS
+      - uses: actions/attest-build-provenance@v4
+        with:
+          subject-path: dist/*
+      - uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ env.RELEASE_TAG }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/repobox-*.tar.gz
+            dist/SHA256SUMS
+
+  crates-io:
+    name: Publish crates.io packages
+    needs: github-release
+    runs-on: ubuntu-latest
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.RELEASE_TAG }}
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - name: Publish workspace in dependency order
+        if: env.CARGO_REGISTRY_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo publish --locked --package repobox-core
+          sleep 30
+          cargo publish --locked --package repobox-provider-planetscale
+          cargo publish --locked --package repobox-runtime-compose
+          sleep 30
+          cargo publish --locked --package repobox
+      - name: Report missing token
+        if: env.CARGO_REGISTRY_TOKEN == ''
+        run: echo 'CARGO_REGISTRY_TOKEN is unset; crates.io publication was skipped.'
+
+  homebrew:
+    name: Update Homebrew tap
+    needs: github-release
+    runs-on: ubuntu-latest
+    env:
+      GH_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+    steps:
+      - name: Update formula from release checksums
+        if: env.GH_TOKEN != ''
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="$RELEASE_TAG"
+          version="${tag#v}"
+          gh repo clone abhirupghosh/homebrew-tap tap
+          cd tap
+          mkdir -p Formula
+          curl --fail --silent --show-error --location \
+            "https://github.com/abhirupghosh/repobox/releases/download/$tag/SHA256SUMS" \
+            --output SHA256SUMS
+          sha_linux_x86=$(awk '/x86_64-unknown-linux-gnu/ {print $1}' SHA256SUMS)
+          sha_linux_arm=$(awk '/aarch64-unknown-linux-gnu/ {print $1}' SHA256SUMS)
+          sha_macos_x86=$(awk '/x86_64-apple-darwin/ {print $1}' SHA256SUMS)
+          sha_macos_arm=$(awk '/aarch64-apple-darwin/ {print $1}' SHA256SUMS)
+          ruby - "$tag" "$version" "$sha_linux_x86" "$sha_linux_arm" "$sha_macos_x86" "$sha_macos_arm" <<'RUBY'
+          tag, version, linux_x86, linux_arm, macos_x86, macos_arm = ARGV
+          File.write("Formula/repobox.rb", <<~FORMULA)
+            class Repobox < Formula
+              desc "Agent-native persistent development environments"
+              homepage "https://github.com/abhirupghosh/repobox"
+              version "#{version}"
+              license "MIT"
+
+              on_macos do
+                if Hardware::CPU.arm?
+                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-apple-darwin.tar.gz"
+                  sha256 "#{macos_arm}"
+                else
+                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-apple-darwin.tar.gz"
+                  sha256 "#{macos_x86}"
+                end
+              end
+
+              on_linux do
+                if Hardware::CPU.arm?
+                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-unknown-linux-gnu.tar.gz"
+                  sha256 "#{linux_arm}"
+                else
+                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-unknown-linux-gnu.tar.gz"
+                  sha256 "#{linux_x86}"
+                end
+              end
+
+              def install
+                bin.install "repobox"
+              end
+
+              test do
+                assert_match version.to_s, shell_output("#{bin}/repobox --version")
+              end
+            end
+          FORMULA
+          RUBY
+          rm SHA256SUMS
+          git config user.name github-actions[bot]
+          git config user.email 41898282+github-actions[bot]@users.noreply.github.com
+          git add Formula/repobox.rb
+          git commit -m "repobox $tag"
+          git push
+      - name: Report missing token
+        if: env.GH_TOKEN == ''
+        run: echo 'HOMEBREW_TAP_TOKEN is unset; tap update was skipped.'

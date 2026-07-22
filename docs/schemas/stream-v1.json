@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "data": true,
+    "event": {
+      "type": "string"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "sequence": {
+      "format": "uint64",
+      "minimum": 0,
+      "type": "integer"
+    },
+    "timestamp": {
+      "format": "date-time",
+      "type": "string"
+    }
+  },
+  "required": [
+    "schema_version",
+    "sequence",
+    "timestamp",
+    "event",
+    "data"
+  ],
+  "title": "StreamEvent",
+  "type": "object"
+}

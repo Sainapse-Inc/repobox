@@ -1,0 +1,62 @@
+{
+  "$defs": {
+    "PlannedCall": {
+      "properties": {
+        "action": {
+          "type": "string"
+        },
+        "provider": {
+          "type": "string"
+        },
+        "resource": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "provider",
+        "action",
+        "resource"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "environment": {
+      "type": "string"
+    },
+    "estimated_cost": {
+      "type": [
+        "string",
+        "null"
+      ]
+    },
+    "operation": {
+      "type": "string"
+    },
+    "provider_calls": {
+      "items": {
+        "$ref": "#/$defs/PlannedCall"
+      },
+      "type": "array"
+    },
+    "rollback_available": {
+      "type": "boolean"
+    },
+    "warnings": {
+      "items": {
+        "type": "string"
+      },
+      "type": "array"
+    }
+  },
+  "required": [
+    "operation",
+    "environment",
+    "provider_calls",
+    "warnings",
+    "rollback_available"
+  ],
+  "title": "DryRunPlan",
+  "type": "object"
+}

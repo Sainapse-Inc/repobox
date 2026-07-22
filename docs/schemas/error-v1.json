@@ -1,0 +1,69 @@
+{
+  "$defs": {
+    "ErrorKind": {
+      "enum": [
+        "runtime",
+        "usage",
+        "not_found",
+        "authentication",
+        "conflict",
+        "permission"
+      ],
+      "type": "string"
+    },
+    "RepoboxError": {
+      "properties": {
+        "code": {
+          "type": "string"
+        },
+        "doc_url": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "kind": {
+          "$ref": "#/$defs/ErrorKind"
+        },
+        "message": {
+          "type": "string"
+        },
+        "request_id": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "suggestion": {
+          "type": [
+            "string",
+            "null"
+          ]
+        }
+      },
+      "required": [
+        "kind",
+        "code",
+        "message"
+      ],
+      "type": "object"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "error": {
+      "$ref": "#/$defs/RepoboxError"
+    },
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "error"
+  ],
+  "title": "ErrorEnvelope",
+  "type": "object"
+}

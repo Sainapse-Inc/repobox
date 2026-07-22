@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  REPOBOX_NO_UPDATE_CHECK: "1"
+
+jobs:
+  quality:
+    name: Format, lint, test, and contracts
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Install contract tools
+        run: sudo apt-get update && sudo apt-get install --yes jq shellcheck
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Lint
+        run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
+      - name: Test
+        run: cargo test --workspace --all-targets --locked
+      - name: Audit shell scripts
+        run: shellcheck scripts/*.sh
+      - name: Audit help surface
+        run: scripts/audit-help.sh
+      - name: Regenerate public schemas
+        run: scripts/generate-schemas.sh
+      - name: Reject schema drift
+        run: git diff --exit-code -- docs/schemas
+      - name: Check package manifests
+        run: cargo package --workspace --locked --no-verify
+
+  macos:
+    name: macOS tests
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.97.1
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --all-targets --locked
+
+  audit:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: rustsec/audit-check@v2
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+  secrets:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
+      - uses: gitleaks/gitleaks-action@v3
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

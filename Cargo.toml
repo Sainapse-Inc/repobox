@@ -1,0 +1,65 @@
+[workspace]
+members = [
+  "crates/repobox-core",
+  "crates/repobox-provider-planetscale",
+  "crates/repobox-runtime-compose",
+  "crates/repobox",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97.1"
+license = "MIT"
+authors = ["Abhirup Ghosh"]
+repository = "https://github.com/abhirupghosh/repobox"
+homepage = "https://github.com/abhirupghosh/repobox"
+
+[workspace.dependencies]
+async-trait = "0.1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4.5", features = ["derive", "env", "wrap_help"] }
+clap_complete = "4.5"
+crossbeam-channel = "0.5"
+crossterm = { version = "0.29", features = ["event-stream"] }
+directories = "6"
+hex = "0.4"
+json-patch = "4"
+keyring = { version = "3", features = ["apple-native", "crypto-rust", "linux-native-sync-persistent", "vendored", "windows-native"] }
+ratatui = { version = "0.30", features = ["crossterm"] }
+regex = "1"
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+rpassword = "7"
+schemars = { version = "1", features = ["chrono04", "uuid1", "url2"] }
+secrecy = { version = "0.10", features = ["serde"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml_ng = "0.10"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["fs", "io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+url = { version = "2", features = ["serde"] }
+uuid = { version = "1", features = ["serde", "v4", "v7"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+module_name_repetitions = "allow"
+must_use_candidate = "allow"
+missing_errors_doc = "allow"
+missing_panics_doc = "allow"
+result_large_err = "allow"
+return_self_not_must_use = "allow"
+needless_pass_by_value = "allow"
+struct_excessive_bools = "allow"
+too_many_lines = "allow"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

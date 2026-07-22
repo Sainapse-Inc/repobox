@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "properties": {
+    "command": {
+      "type": "string"
+    },
+    "data": true,
+    "schema_version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "schema_version",
+    "command",
+    "data"
+  ],
+  "title": "SuccessEnvelope",
+  "type": "object"
+}

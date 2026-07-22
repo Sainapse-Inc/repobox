@@ -1,0 +1,40 @@
+name: Bug report
+description: Report a reproducible Repobox defect without including secrets.
+title: "bug: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Never include service tokens, database URLs, private data, or unredacted provider responses.
+  - type: input
+    id: version
+    attributes:
+      label: Repobox version
+      placeholder: repobox 0.1.0
+    validations:
+      required: true
+  - type: dropdown
+    id: platform
+    attributes:
+      label: Platform
+      options: [Linux x86_64, Linux arm64, macOS x86_64, macOS arm64, Other]
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal redacted reproduction
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior and structured error code
+    validations:
+      required: true

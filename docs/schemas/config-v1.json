@@ -1,0 +1,302 @@
+{
+  "$defs": {
+    "AgentConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "claude": {
+          "default": true,
+          "type": "boolean"
+        },
+        "codex": {
+          "default": true,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "BootstrapConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "mode": {
+          "$ref": "#/$defs/BootstrapMode",
+          "default": "attach"
+        }
+      },
+      "type": "object"
+    },
+    "BootstrapMode": {
+      "enum": [
+        "attach",
+        "empty",
+        "import"
+      ],
+      "type": "string"
+    },
+    "ComposeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "files": {
+          "default": [
+            "compose.yaml"
+          ],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "profiles": {
+          "default": [],
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        }
+      },
+      "type": "object"
+    },
+    "DataConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "allow_copy": {
+          "default": false,
+          "type": "boolean"
+        }
+      },
+      "type": "object"
+    },
+    "DatabaseEnvConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "direct": {
+          "type": "string"
+        },
+        "pooled": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "pooled",
+        "direct"
+      ],
+      "type": "object"
+    },
+    "GitConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "base_branch": {
+          "default": "main",
+          "type": "string"
+        }
+      },
+      "type": "object"
+    },
+    "LocalServiceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "compose_service": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "compose_service"
+      ],
+      "type": "object"
+    },
+    "NativeConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "command": {
+          "items": {
+            "type": "string"
+          },
+          "type": "array"
+        },
+        "interactive": {
+          "default": false,
+          "type": "boolean"
+        },
+        "working_directory": {
+          "default": ".",
+          "type": "string"
+        }
+      },
+      "required": [
+        "command"
+      ],
+      "type": "object"
+    },
+    "ProjectConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "git": {
+          "$ref": "#/$defs/GitConfig",
+          "default": {
+            "base_branch": "main"
+          }
+        },
+        "id": {
+          "format": "uuid",
+          "type": "string"
+        },
+        "name": {
+          "type": "string"
+        }
+      },
+      "required": [
+        "id",
+        "name"
+      ],
+      "type": "object"
+    },
+    "RemoteServiceConfig": {
+      "oneOf": [
+        {
+          "properties": {
+            "base_branch": {
+              "default": "main",
+              "type": "string"
+            },
+            "cluster_size": {
+              "default": "auto-smallest",
+              "type": "string"
+            },
+            "database": {
+              "type": "string"
+            },
+            "organization": {
+              "type": "string"
+            },
+            "provider": {
+              "const": "planetscale",
+              "type": "string"
+            }
+          },
+          "required": [
+            "provider",
+            "organization",
+            "database"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "RuntimeConfig": {
+      "oneOf": [
+        {
+          "properties": {
+            "compose": {
+              "$ref": "#/$defs/ComposeConfig"
+            },
+            "driver": {
+              "const": "compose",
+              "type": "string"
+            }
+          },
+          "required": [
+            "driver",
+            "compose"
+          ],
+          "type": "object"
+        },
+        {
+          "properties": {
+            "driver": {
+              "const": "native",
+              "type": "string"
+            },
+            "native": {
+              "$ref": "#/$defs/NativeConfig"
+            }
+          },
+          "required": [
+            "driver",
+            "native"
+          ],
+          "type": "object"
+        }
+      ]
+    },
+    "ServiceConfig": {
+      "additionalProperties": false,
+      "properties": {
+        "bootstrap": {
+          "$ref": "#/$defs/BootstrapConfig",
+          "default": {
+            "mode": "attach"
+          }
+        },
+        "env": {
+          "$ref": "#/$defs/DatabaseEnvConfig"
+        },
+        "kind": {
+          "$ref": "#/$defs/ServiceKind"
+        },
+        "local": {
+          "$ref": "#/$defs/LocalServiceConfig"
+        },
+        "primary": {
+          "default": false,
+          "type": "boolean"
+        },
+        "remote": {
+          "$ref": "#/$defs/RemoteServiceConfig"
+        }
+      },
+      "required": [
+        "kind",
+        "local",
+        "remote",
+        "env"
+      ],
+      "type": "object"
+    },
+    "ServiceKind": {
+      "enum": [
+        "postgres"
+      ],
+      "type": "string"
+    }
+  },
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "additionalProperties": false,
+  "properties": {
+    "agents": {
+      "$ref": "#/$defs/AgentConfig",
+      "default": {
+        "claude": true,
+        "codex": true
+      }
+    },
+    "data": {
+      "$ref": "#/$defs/DataConfig",
+      "default": {
+        "allow_copy": false
+      }
+    },
+    "project": {
+      "$ref": "#/$defs/ProjectConfig"
+    },
+    "runtime": {
+      "$ref": "#/$defs/RuntimeConfig"
+    },
+    "services": {
+      "additionalProperties": {
+        "$ref": "#/$defs/ServiceConfig"
+      },
+      "default": {},
+      "type": "object"
+    },
+    "version": {
+      "format": "uint32",
+      "minimum": 0,
+      "type": "integer"
+    }
+  },
+  "required": [
+    "version",
+    "project",
+    "runtime"
+  ],
+  "title": "RepoboxConfig",
+  "type": "object"
+}
