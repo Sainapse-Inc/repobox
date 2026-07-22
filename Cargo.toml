@@ -13,8 +13,8 @@ edition = "2024"
 rust-version = "1.97.1"
 license = "MIT"
 authors = ["Abhirup Ghosh"]
-repository = "https://github.com/abhirupghosh/repobox"
-homepage = "https://github.com/abhirupghosh/repobox"
+repository = "https://github.com/Sainapse-Inc/repobox"
+homepage = "https://github.com/Sainapse-Inc/repobox"
 
 [workspace.dependencies]
 async-trait = "0.1"

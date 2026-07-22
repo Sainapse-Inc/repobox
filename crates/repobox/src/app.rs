@@ -108,7 +108,7 @@ async fn maybe_update_notice(cli: &Cli, output: &Output) {
         .ok()
         .map(|client| {
             client
-                .get("https://api.github.com/repos/abhirupghosh/repobox/releases/latest")
+                .get("https://api.github.com/repos/Sainapse-Inc/repobox/releases/latest")
                 .header(reqwest::header::USER_AGENT, "repobox-update-check")
                 .send()
         });
@@ -1547,7 +1547,7 @@ async fn update(cli: &Cli, output: &Output, check_only: bool) -> Result<()> {
         html_url: String,
     }
     let response = reqwest::Client::new()
-        .get("https://api.github.com/repos/abhirupghosh/repobox/releases/latest")
+        .get("https://api.github.com/repos/Sainapse-Inc/repobox/releases/latest")
         .header(
             reqwest::header::USER_AGENT,
             concat!("repobox/", env!("CARGO_PKG_VERSION")),

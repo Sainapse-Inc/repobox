@@ -19,6 +19,8 @@ All notable changes to Repobox will be documented here.
 
 ### Changed
 
+- Moved canonical GitHub source and Homebrew distribution ownership to the
+  `Sainapse-Inc` organization.
 - Extended provider readiness budgets to tolerate observed PlanetScale
   transitions and reuse pending databases and branches during exact job resume.
 - Hardened the manual release workflow with immutable action references,
@@ -27,6 +29,8 @@ All notable changes to Repobox will be documented here.
 
 ### Fixed
 
+- Keep secret scanning license-independent after the organization transfer by
+  installing a checksum-pinned Gitleaks CLI directly.
 - Honor the explicit `--environment` selector for top-level `logs` instead of
   silently falling back to `REPOBOX_ENV` or the current Git branch.
 - Resume the explicitly requested create or pull job instead of selecting a

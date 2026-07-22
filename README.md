@@ -19,7 +19,7 @@ The v0.1 implementation starts with PostgreSQL on PlanetScale and Docker Compose
 Before the first tagged release, build from source:
 
 ```sh
-git clone https://github.com/abhirupghosh/repobox.git
+git clone https://github.com/Sainapse-Inc/repobox.git
 cd repobox
 cargo install --path crates/repobox --locked
 ```
@@ -28,7 +28,7 @@ Tagged releases are designed for:
 
 ```sh
 cargo install repobox --locked
-brew install abhirupghosh/tap/repobox
+brew install Sainapse-Inc/tap/repobox
 ```
 
 Release archives will cover Linux and macOS on x86_64 and arm64 with SHA-256 checksums and provenance attestations.
