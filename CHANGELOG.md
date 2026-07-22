@@ -19,6 +19,8 @@ All notable changes to Repobox will be documented here.
 
 ### Changed
 
+- Moved canonical GitHub source and Homebrew distribution ownership to the
+  `Sainapse-Inc` organization.
 - Extended provider readiness budgets to tolerate observed PlanetScale
   transitions and reuse pending databases and branches during exact job resume.
 - Hardened the manual release workflow with immutable action references,

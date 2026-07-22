@@ -385,7 +385,7 @@ jobs:
           response="$(mktemp)"
           formula="$(mktemp)"
           trap 'rm -f "$response" "$formula"' EXIT
-          status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --header "Authorization: Bearer $HOMEBREW_TAP_TOKEN" --header 'Accept: application/vnd.github+json' --user-agent "repobox-release/${GITHUB_RUN_ID}" "https://api.github.com/repos/abhirupghosh/homebrew-tap/contents/Formula/repobox.rb")"
+          status="$(curl --silent --show-error --output "$response" --write-out '%{http_code}' --header "Authorization: Bearer $HOMEBREW_TAP_TOKEN" --header 'Accept: application/vnd.github+json' --user-agent "repobox-release/${GITHUB_RUN_ID}" "https://api.github.com/repos/Sainapse-Inc/homebrew-tap/contents/Formula/repobox.rb")"
           case "$status" in
             200)
               jq -er '.content' "$response" | base64 --decode > "$formula"
@@ -653,7 +653,7 @@ jobs:
             local version="$2"
             local status
             status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
-              --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/abhirupghosh/repobox)" \
+              --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/Sainapse-Inc/repobox)" \
               "https://crates.io/api/v1/crates/$crate/$version")" || {
               echo "::error::Could not query crates.io for $crate $version."
               return 2
@@ -836,7 +836,7 @@ jobs:
           status="$(curl --silent --show-error --output "$response_file" --write-out '%{http_code}' \
             --header "Authorization: Bearer $GH_TOKEN" \
             --header 'Accept: application/vnd.github+json' \
-            --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/abhirupghosh/repobox)" \
+            --user-agent "repobox-release/${GITHUB_RUN_ID} (https://github.com/Sainapse-Inc/repobox)" \
             "https://api.github.com/repos/${GITHUB_REPOSITORY}/releases/tags/$tag")" || {
               echo "::error::Could not query GitHub release state for $tag."
               exit 1
@@ -1047,8 +1047,8 @@ jobs:
           done
           (cd dist && shasum -a 256 --check SHA256SUMS)
 
-          brew tap abhirupghosh/tap https://github.com/abhirupghosh/homebrew-tap
-          tap_dir="$(brew --repository abhirupghosh/tap)"
+          brew tap Sainapse-Inc/tap https://github.com/Sainapse-Inc/homebrew-tap
+          tap_dir="$(brew --repository Sainapse-Inc/tap)"
           formula="$tap_dir/Formula/repobox.rb"
           formula_is_new=false
           if [[ ! -f "$formula" ]]; then
@@ -1087,26 +1087,26 @@ jobs:
           File.write(formula, <<~FORMULA)
             class Repobox < Formula
               desc "Agent-native persistent development environments"
-              homepage "https://github.com/abhirupghosh/repobox"
+              homepage "https://github.com/Sainapse-Inc/repobox"
               version "#{version}"
               license "MIT"
 
               on_macos do
                 if Hardware::CPU.arm?
-                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-apple-darwin.tar.gz"
+                  url "https://github.com/Sainapse-Inc/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-apple-darwin.tar.gz"
                   sha256 "#{macos_arm}"
                 else
-                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-apple-darwin.tar.gz"
+                  url "https://github.com/Sainapse-Inc/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-apple-darwin.tar.gz"
                   sha256 "#{macos_x86}"
                 end
               end
 
               on_linux do
                 if Hardware::CPU.arm?
-                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-unknown-linux-gnu.tar.gz"
+                  url "https://github.com/Sainapse-Inc/repobox/releases/download/#{tag}/repobox-#{tag}-aarch64-unknown-linux-gnu.tar.gz"
                   sha256 "#{linux_arm}"
                 else
-                  url "https://github.com/abhirupghosh/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-unknown-linux-gnu.tar.gz"
+                  url "https://github.com/Sainapse-Inc/repobox/releases/download/#{tag}/repobox-#{tag}-x86_64-unknown-linux-gnu.tar.gz"
                   sha256 "#{linux_x86}"
                 end
               end
@@ -1129,8 +1129,8 @@ jobs:
           else
             brew audit --strict --online --formula "$formula"
           fi
-          brew install --formula abhirupghosh/tap/repobox
-          brew test abhirupghosh/tap/repobox
+          brew install --formula Sainapse-Inc/tap/repobox
+          brew test Sainapse-Inc/tap/repobox
 
       - name: Push tested formula
         shell: bash
@@ -1141,7 +1141,7 @@ jobs:
           : "${GH_TOKEN:?HOMEBREW_TAP_TOKEN passed preflight but is now missing}"
 
           tag="${{ needs.preflight.outputs.tag }}"
-          tap_dir="$(brew --repository abhirupghosh/tap)"
+          tap_dir="$(brew --repository Sainapse-Inc/tap)"
           cd "$tap_dir"
           git add Formula/repobox.rb
           if git diff --cached --quiet; then

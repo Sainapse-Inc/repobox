@@ -40,7 +40,7 @@ The release workflow expects:
 - `CARGO_REGISTRY_TOKEN` from a verified crates.io account and authorized to
   publish new crates;
 - `HOMEBREW_TAP_TOKEN` as a fine-grained GitHub token scoped only to
-  `abhirupghosh/homebrew-tap` with repository Contents read/write permission;
+  `Sainapse-Inc/homebrew-tap` with repository Contents read/write permission;
 - a protected, signed-off stable tag named exactly `v<workspace-version>`
   after the live smoke;
 - an explicit full commit SHA for every release, which the tag must resolve to;
