@@ -29,6 +29,8 @@ All notable changes to Repobox will be documented here.
 
 ### Fixed
 
+- Keep secret scanning license-independent after the organization transfer by
+  installing a checksum-pinned Gitleaks CLI directly.
 - Honor the explicit `--environment` selector for top-level `logs` instead of
   silently falling back to `REPOBOX_ENV` or the current Git branch.
 - Resume the explicitly requested create or pull job instead of selecting a

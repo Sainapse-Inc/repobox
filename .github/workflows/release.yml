@@ -229,9 +229,10 @@ jobs:
         with:
           fetch-depth: 0
           ref: ${{ needs.preflight.outputs.commit }}
-      - uses: gitleaks/gitleaks-action@e0c47f4f8be36e29cdc102c57e68cb5cbf0e8d1e # v3.0.0
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install Gitleaks
+        run: scripts/install-gitleaks.sh "$RUNNER_TEMP/gitleaks"
+      - name: Scan repository history
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --no-banner'
 
   build:
     name: Build ${{ matrix.target }}
