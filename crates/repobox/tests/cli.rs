@@ -5,10 +5,15 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 
 use assert_cmd::Command;
+use chrono::Utc;
 use predicates::prelude::*;
 use repobox_core::config::RepoboxConfig;
+use repobox_core::identity::provider_branch_name;
 use repobox_core::jobs::{JobKind, JobRecord, JobStatus, JobStore};
 use repobox_core::paths::RepoboxPaths;
+use repobox_core::state::{
+    DatabaseBinding, EnvironmentRecord, EnvironmentStatus, ProjectState, StateStore,
+};
 
 fn fake_repository() -> tempfile::TempDir {
     let directory = tempfile::tempdir().unwrap();
@@ -107,6 +112,91 @@ fn repository_with_resumable_job(kind: JobKind) -> (tempfile::TempDir, JobRecord
     let ledger = isolated_paths(repository.path()).jobs(config.project.id);
     JobStore::new(&ledger).append(&job).unwrap();
     (repository, job, ledger)
+}
+
+fn repository_with_old_deleted_pull(
+    status: JobStatus,
+) -> (tempfile::TempDir, JobRecord, PathBuf, PathBuf) {
+    let repository = fake_repository();
+    isolated_command(repository.path())
+        .args([
+            "init",
+            "--organization",
+            "acme",
+            "--yes",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let config = RepoboxConfig::load(&repository.path().join(".repobox.yml")).unwrap();
+    let environment = "feature/run-guard";
+    let canonical = provider_branch_name(config.project.id, environment).unwrap();
+    let paths = isolated_paths(repository.path());
+    let state_path = paths.state(config.project.id);
+    let state_store = StateStore::new(&state_path);
+    let mut state = ProjectState::new(config.project.id);
+    let mut record = EnvironmentRecord::new(environment, &canonical);
+    record.status = EnvironmentStatus::Degraded;
+    state.environments.insert(environment.to_owned(), record);
+    state_store.save(&state).unwrap();
+
+    let mut pull = JobRecord::new(
+        JobKind::EnvironmentPull,
+        config.project.id,
+        environment,
+        ["refresh:db"],
+    );
+    pull.status = status;
+    pull.steps[0].resource = serde_json::json!({
+        "phase": "old_deleted",
+        "organization": "acme",
+        "database": "app",
+        "base_branch": "main",
+        "canonical": canonical,
+        "staging": format!("{canonical}-next-test"),
+    });
+    let ledger = paths.jobs(config.project.id);
+    JobStore::new(&ledger).append(&pull).unwrap();
+    (repository, pull, state_path, ledger)
+}
+
+fn blocked_run_error_for_old_deleted_pull(status: JobStatus) -> (serde_json::Value, String) {
+    let (repository, pull, state_path, ledger) = repository_with_old_deleted_pull(status);
+    let state_before = fs::read(&state_path).unwrap();
+    let ledger_before = fs::read(&ledger).unwrap();
+    let marker = repository.path().join("runtime-mutated");
+    let docker = repository.path().join("bin/docker");
+    fs::write(
+        &docker,
+        "#!/bin/sh\n: > \"$REPOBOX_TEST_RUNTIME_MARKER\"\nexit 99\n",
+    )
+    .unwrap();
+    fs::set_permissions(&docker, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let output = isolated_command(repository.path())
+        .env("REPOBOX_TEST_RUNTIME_MARKER", &marker)
+        .args([
+            "run",
+            "--environment",
+            "feature/run-guard",
+            "--yes",
+            "--no-tui",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert_eq!(fs::read(&state_path).unwrap(), state_before);
+    assert_eq!(fs::read(&ledger).unwrap(), ledger_before);
+    assert!(!marker.exists());
+    (
+        serde_json::from_slice(&output.stderr).unwrap(),
+        pull.id.to_string(),
+    )
 }
 
 #[test]
@@ -296,6 +386,76 @@ fn environment_dry_run_needs_no_provider_credentials() {
 }
 
 #[test]
+fn environment_delete_dry_run_lists_exact_checkpointed_targets() {
+    let repository = fake_repository();
+    isolated_command(repository.path())
+        .args([
+            "init",
+            "--organization",
+            "acme",
+            "--yes",
+            "--no-input",
+            "--json",
+        ])
+        .assert()
+        .success();
+    let config = RepoboxConfig::load(&repository.path().join(".repobox.yml")).unwrap();
+    let environment = "feature/delete-plan";
+    let canonical = provider_branch_name(config.project.id, environment).unwrap();
+    let paths = isolated_paths(repository.path());
+    let state_store = StateStore::new(paths.state(config.project.id));
+    let mut state = ProjectState::new(config.project.id);
+    let mut record = EnvironmentRecord::new(environment, &canonical);
+    record.status = EnvironmentStatus::Ready;
+    record.databases.insert(
+        "db".to_owned(),
+        DatabaseBinding {
+            service: "db".to_owned(),
+            provider: "planetscale".to_owned(),
+            organization: "checkpointed-org".to_owned(),
+            database: "checkpointed-db".to_owned(),
+            branch: canonical.clone(),
+            role_id: "role-1".to_owned(),
+            role_name: "repobox-db".to_owned(),
+            ready: true,
+            updated_at: Utc::now(),
+        },
+    );
+    state.environments.insert(environment.to_owned(), record);
+    state_store.save(&state).unwrap();
+
+    let output = isolated_command(repository.path())
+        .args([
+            "env",
+            "delete",
+            environment,
+            "--dry-run",
+            "--yes",
+            "--json",
+            "--no-input",
+        ])
+        .output()
+        .unwrap();
+
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let value: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(value["data"]["operation"], "environment_delete");
+    assert_eq!(value["data"]["rollback_available"], false);
+    assert_eq!(
+        value["data"]["provider_calls"],
+        serde_json::json!([{
+            "provider": "planetscale",
+            "action": "delete_branch",
+            "resource": format!("checkpointed-org/checkpointed-db/{canonical} (db)"),
+        }])
+    );
+}
+
+#[test]
 fn job_resume_requires_structured_confirmation_before_provider_access() {
     let (repository, job, ledger) = repository_with_resumable_job(JobKind::EnvironmentCreate);
     let before = fs::read(&ledger).unwrap();
@@ -331,6 +491,34 @@ fn pull_job_resume_requires_confirmation_before_runtime_or_provider_access() {
     let error: serde_json::Value = serde_json::from_slice(&output.stderr).unwrap();
     assert_eq!(error["error"]["code"], "confirmation_required");
     assert_eq!(fs::read(&ledger).unwrap(), before);
+}
+
+#[test]
+fn run_blocks_old_deleted_pull_before_provider_or_runtime_mutation() {
+    let (error, job_id) = blocked_run_error_for_old_deleted_pull(JobStatus::Degraded);
+    assert_eq!(error["error"]["code"], "environment_recovery_required");
+    assert!(
+        error["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains(&job_id)
+    );
+    assert!(
+        error["error"]["suggestion"]
+            .as_str()
+            .unwrap()
+            .contains(&job_id)
+    );
+}
+
+#[test]
+fn run_requires_delete_after_an_old_deleted_pull_is_canceled() {
+    let (error, job_id) = blocked_run_error_for_old_deleted_pull(JobStatus::Canceled);
+    assert_eq!(error["error"]["code"], "environment_recovery_required");
+    let suggestion = error["error"]["suggestion"].as_str().unwrap();
+    assert!(suggestion.contains(&job_id));
+    assert!(suggestion.contains("repobox env delete feature/run-guard --yes"));
+    assert!(!suggestion.contains("job resume"));
 }
 
 #[test]
