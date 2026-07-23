@@ -92,6 +92,33 @@ Each service chooses one bootstrap mode:
 
 Import requires `data.allow_copy: true`, creates no dump file, and does no masking. Read the [configuration reference](docs/configuration.md) before using production-derived data.
 
+The source PostgreSQL service image must provide `sh`, `kill`, `pg_dump`, and
+`pg_isready`. Repobox waits for a source it started, then uses a control-channel
+watchdog so an interrupted import also stops the dump inside the Compose
+container. Standard PostgreSQL images satisfy these requirements.
+
+For PlanetScale's `sslrootcert=system` profile, Repobox uses a local `psql` only
+when its major version is 16 or newer. An older or missing client falls back to
+the managed PostgreSQL 18 Docker image.
+
+`auto-smallest` is a cost default, not an import-capacity estimate. Databases
+with wide JSON or JSONB rows can require a larger PlanetScale cluster while
+`psql` parses the logical dump. If an import fails, inspect the durable job:
+
+```sh
+repobox job view latest --json
+```
+
+Repobox retains a bounded, credential-redacted `pg_dump` or `psql` diagnostic
+instead of replacing it with a generic broken-pipe error. For a confirmed
+provider out-of-memory restart, resize the existing PlanetScale database, pin
+the new `remote.cluster_size` in `.repobox.yml`, wait for the resize to finish,
+and resume the exact job:
+
+```sh
+repobox job resume EXACT_UUID --yes --json --no-input
+```
+
 ## Project status
 
 The offline v0.1 implementation and test suite are complete. A credentialed
