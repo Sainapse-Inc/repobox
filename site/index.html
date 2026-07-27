@@ -1,0 +1,461 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>Repobox — Local code. Persistent data.</title>
+    <meta
+      name="description"
+      content="Repobox is an agent-native Rust CLI that keeps application code local while moving development Postgres into persistent, branch-scoped environments."
+    >
+    <meta name="theme-color" content="#090c0b">
+    <meta property="og:title" content="Repobox — Local code. Persistent data.">
+    <meta
+      property="og:description"
+      content="A local-first development environment CLI for persistent, branch-scoped data."
+    >
+    <meta property="og:type" content="website">
+    <link rel="icon" href="/favicon.svg" type="image/svg+xml">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link rel="stylesheet" href="/styles.css">
+    <link
+      rel="preload"
+      href="https://fonts.gstatic.com/s/barlowcondensed/v13/HTxwL3I-JCGChYJ8VI-L6OO_au7B47b1z3bWuQ.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    >
+    <link
+      rel="preload"
+      href="https://fonts.gstatic.com/s/ibmplexsans/v23/zYXzKVElMYYaJe8bpLHnCwDKr932-G7dytD-Dmu1syxeKYY.woff2"
+      as="font"
+      type="font/woff2"
+      crossorigin
+    >
+  </head>
+  <body>
+    <a class="skip-link" href="#main">Skip to content</a>
+
+    <header class="site-header">
+      <nav class="nav shell" aria-label="Primary navigation">
+        <a class="wordmark" href="/" aria-label="Repobox home">
+          <svg aria-hidden="true" viewBox="0 0 32 32">
+            <path d="M4 5h15v6H10v5h12v11H4z"></path>
+            <path class="wordmark-signal" d="M23 5h5v6h-5z"></path>
+          </svg>
+          <span>repobox</span>
+        </a>
+
+        <div class="nav-status">
+          <span class="status-dot" aria-hidden="true"></span>
+          databases first
+          <span aria-hidden="true">/</span>
+          early access
+        </div>
+
+        <div class="nav-links">
+          <a
+            href="https://github.com/Sainapse-Inc/repobox/tree/main/docs"
+            rel="noreferrer"
+          >Docs</a>
+          <a
+            class="nav-github"
+            href="https://github.com/Sainapse-Inc/repobox"
+            rel="noreferrer"
+          >
+            GitHub
+            <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </nav>
+    </header>
+
+    <main id="main">
+      <section class="hero shell" aria-labelledby="hero-title">
+        <div class="hero-copy">
+          <p class="eyebrow reveal reveal-1">Open source · Rust CLI · Pre-release</p>
+          <h1 id="hero-title" class="reveal reveal-2">
+            Your code stays local.
+            <span>Your database doesn’t have to.</span>
+          </h1>
+          <p class="hero-summary reveal reveal-3">
+            Repobox connects each Git environment to persistent PlanetScale
+            Postgres, then runs the rest of your stack locally. One terminal
+            workflow for developers and coding agents.
+          </p>
+          <div class="hero-actions reveal reveal-4">
+            <a
+              class="button button-primary"
+              href="https://github.com/Sainapse-Inc/repobox"
+              rel="noreferrer"
+            >
+              View on GitHub
+              <span aria-hidden="true">↗</span>
+            </a>
+            <a class="button button-secondary" href="#how">
+              See how it works
+              <span aria-hidden="true">↓</span>
+            </a>
+          </div>
+          <ul class="hero-tags reveal reveal-4" aria-label="Repobox principles">
+            <li>Local-first</li>
+            <li>Branch-scoped data</li>
+            <li>Agent-native</li>
+          </ul>
+        </div>
+
+        <div class="hero-proof reveal reveal-3">
+          <div class="proof-label" aria-hidden="true">
+            <span>RUN MANIFEST</span>
+            <span>RBX / 001</span>
+          </div>
+          <div class="terminal" role="group" aria-label="Example Repobox commands">
+            <div class="terminal-bar" aria-hidden="true">
+              <span class="terminal-dots"><i></i><i></i><i></i></span>
+              <span>~/code/my-app</span>
+              <span>zsh</span>
+            </div>
+            <pre><code><span class="prompt">$</span> repobox auth login
+
+<span class="prompt">$</span> cd ~/code/my-app
+<span class="prompt">$</span> repobox run
+
+<span class="prompt">$</span> repobox status</code></pre>
+          </div>
+          <div class="proof-routing" aria-hidden="true">
+            <span><i></i> local application</span>
+            <span><i></i> remote postgres</span>
+            <span><i></i> feature/payments</span>
+          </div>
+        </div>
+      </section>
+
+      <div class="manifest-strip" aria-hidden="true">
+        <div class="manifest-track">
+          <span>LOCAL CODE</span><i></i>
+          <span>PERSISTENT DATA</span><i></i>
+          <span>ONE ENVIRONMENT PER BRANCH</span><i></i>
+          <span>TERMINAL ONLY</span><i></i>
+          <span>LOCAL CODE</span><i></i>
+          <span>PERSISTENT DATA</span><i></i>
+          <span>ONE ENVIRONMENT PER BRANCH</span>
+        </div>
+      </div>
+
+      <section id="how" class="workflow shell section" aria-labelledby="how-title">
+        <div class="section-heading">
+          <p class="eyebrow">How it works</p>
+          <h2 id="how-title">From repository to running stack.</h2>
+          <p>
+            Repobox works from the configuration your repository already has.
+            It changes the development environment, not your application.
+          </p>
+        </div>
+
+        <ol class="manifest-list">
+          <li>
+            <span class="manifest-number">01</span>
+            <div>
+              <h3>Discover</h3>
+              <p>
+                Resolve Docker Compose and identify the PostgreSQL services
+                configured for the repository.
+              </p>
+            </div>
+            <code>docker compose config</code>
+          </li>
+          <li>
+            <span class="manifest-number">02</span>
+            <div>
+              <h3>Provision</h3>
+              <p>
+                Map the selected Git environment to persistent PlanetScale
+                Postgres and keep credentials outside the repository.
+              </p>
+            </div>
+            <code>feature/payments → postgres</code>
+          </li>
+          <li>
+            <span class="manifest-number">03</span>
+            <div>
+              <h3>Run locally</h3>
+              <p>
+                Inject remote connection URLs into child processes and start
+                the remaining services on your machine.
+              </p>
+            </div>
+            <code>repobox run</code>
+          </li>
+        </ol>
+
+        <p class="workflow-note">
+          No hosted Repobox control plane. No always-on daemon. Source Compose
+          files stay unchanged.
+        </p>
+      </section>
+
+      <section class="branch-section section" aria-labelledby="branches-title">
+        <div class="branch-layout shell">
+          <div class="branch-copy">
+            <p class="eyebrow">Branch-scoped data</p>
+            <h2 id="branches-title">Change branches. Keep context.</h2>
+            <p>
+              Each selected Git environment maps deterministically to its own
+              remote database branch. Restart your stack without rebuilding
+              the data it depends on.
+            </p>
+            <dl class="branch-facts">
+              <div>
+                <dt>Code</dt>
+                <dd>Your machine</dd>
+              </div>
+              <div>
+                <dt>State</dt>
+                <dd>PlanetScale</dd>
+              </div>
+              <div>
+                <dt>Identity</dt>
+                <dd>Git environment</dd>
+              </div>
+            </dl>
+          </div>
+
+          <div class="branch-diagram">
+            <div class="diagram-label" aria-hidden="true">
+              <span>ENVIRONMENT ROUTING</span>
+              <span>NOT TO SCALE</span>
+            </div>
+            <svg
+              viewBox="0 0 760 380"
+              role="img"
+              aria-labelledby="diagram-title diagram-description"
+            >
+              <title id="diagram-title">One repository routed to three database branches</title>
+              <desc id="diagram-description">
+                A local repository splits into main, feature payments, and
+                agent refactor environments. Each environment connects to a
+                separate persistent Postgres database branch.
+              </desc>
+              <defs>
+                <filter id="node-glow" x="-100%" y="-100%" width="300%" height="300%">
+                  <feGaussianBlur stdDeviation="5" result="blur"></feGaussianBlur>
+                  <feMerge>
+                    <feMergeNode in="blur"></feMergeNode>
+                    <feMergeNode in="SourceGraphic"></feMergeNode>
+                  </feMerge>
+                </filter>
+              </defs>
+
+              <g class="repo-node">
+                <rect x="24" y="135" width="176" height="110" rx="2"></rect>
+                <text x="48" y="170" class="svg-label">LOCAL REPOSITORY</text>
+                <text x="48" y="205" class="svg-title">my-app</text>
+                <text x="48" y="226" class="svg-meta">~/code/my-app</text>
+              </g>
+
+              <path class="trunk" d="M200 190H286"></path>
+
+              <g class="route route-main">
+                <path d="M286 190V72H485"></path>
+                <circle cx="286" cy="190" r="5"></circle>
+                <rect x="485" y="35" width="238" height="74" rx="2"></rect>
+                <circle class="route-node" cx="692" cy="72" r="7"></circle>
+                <text x="509" y="66" class="svg-title">main</text>
+                <text x="509" y="88" class="svg-meta">persistent postgres</text>
+              </g>
+
+              <g class="route route-feature">
+                <path d="M286 190H485"></path>
+                <rect x="485" y="153" width="238" height="74" rx="2"></rect>
+                <circle class="route-node" cx="692" cy="190" r="7"></circle>
+                <text x="509" y="184" class="svg-title">feature/payments</text>
+                <text x="509" y="206" class="svg-meta">persistent postgres</text>
+              </g>
+
+              <g class="route route-agent">
+                <path d="M286 190V308H485"></path>
+                <rect x="485" y="271" width="238" height="74" rx="2"></rect>
+                <circle class="route-node" cx="692" cy="308" r="7"></circle>
+                <text x="509" y="302" class="svg-title">agent/refactor</text>
+                <text x="509" y="324" class="svg-meta">persistent postgres</text>
+              </g>
+            </svg>
+            <div
+              class="mobile-branch-map"
+              role="img"
+              aria-label="The local my-app repository branches into separate main, feature payments, and agent refactor persistent Postgres environments."
+            >
+              <div class="mobile-repo">
+                <span>Local repository</span>
+                <strong>my-app</strong>
+                <code>~/code/my-app</code>
+              </div>
+              <div class="mobile-routes">
+                <div>
+                  <span>Main</span>
+                  <code>persistent postgres</code>
+                </div>
+                <div>
+                  <span>Feature/payments</span>
+                  <code>persistent postgres</code>
+                </div>
+                <div>
+                  <span>Agent/refactor</span>
+                  <code>persistent postgres</code>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="principles shell section" aria-labelledby="principles-title">
+        <div class="section-heading section-heading-compact">
+          <p class="eyebrow">The operating model</p>
+          <h2 id="principles-title">Built for the terminal era.</h2>
+        </div>
+
+        <div class="principle-grid">
+          <article class="principle">
+            <div class="principle-index">A / LOCAL-FIRST</div>
+            <h3>A lighter local stack.</h3>
+            <p>
+              Keep application code, services, and the fast feedback loop on
+              your machine. Move the stateful dependency that consumes local
+              storage and memory.
+            </p>
+            <div class="placement" role="group" aria-label="Service placement">
+              <div>
+                <span>LOCAL</span>
+                <code>app · worker · frontend</code>
+              </div>
+              <div>
+                <span>REMOTE</span>
+                <code>postgres</code>
+              </div>
+            </div>
+          </article>
+
+          <article class="principle">
+            <div class="principle-index">B / AGENT-NATIVE</div>
+            <h3>One interface for people and agents.</h3>
+            <p>
+              Humans get a fast terminal experience. Coding agents get clean
+              help, dry-runs, and versioned JSON and JSONL contracts.
+            </p>
+            <pre class="agent-commands"><code><span>$</span> repobox agent-context --schemas --json
+<span>$</span> repobox status --json --no-input
+<span>$</span> repobox run --detach --yes --json --no-input</code></pre>
+          </article>
+        </div>
+      </section>
+
+      <section class="scope section" aria-labelledby="scope-title">
+        <div class="scope-inner shell">
+          <div class="scope-intro">
+            <p class="eyebrow">Product scope</p>
+            <h2 id="scope-title">Databases first.</h2>
+            <p>
+              Repobox starts with one expensive local dependency and a narrow,
+              inspectable control surface. The runtime seam can grow later.
+            </p>
+          </div>
+
+          <div class="scope-columns">
+            <div class="scope-column scope-now">
+              <span class="scope-state">Now</span>
+              <h3>Persistent development data</h3>
+              <ul>
+                <li>PlanetScale Postgres</li>
+                <li>Docker Compose projects</li>
+                <li>Linux and macOS</li>
+                <li>Human and agent CLI contracts</li>
+              </ul>
+            </div>
+            <div class="scope-column scope-next">
+              <span class="scope-state">Direction</span>
+              <h3>Remote development runtimes</h3>
+              <ul>
+                <li>Hosted runtime adapters</li>
+                <li>Additional stateful services</li>
+                <li>Periodic source resynchronization</li>
+                <li>More infrastructure providers</li>
+              </ul>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="early-access shell section" aria-labelledby="early-title">
+        <div class="warning-mark" aria-hidden="true">!</div>
+        <div>
+          <p class="eyebrow">Pre-release status</p>
+          <h2 id="early-title">Early, useful, and still being hardened.</h2>
+          <p>
+            Repobox is open source, but its first public version has not been
+            tagged. Try it from source with disposable development data while
+            live provider and recovery gates are completed.
+          </p>
+          <p class="fine-print">
+            PlanetScale resources may be billable. <code>repobox pull</code>
+            replaces environment data from a base-branch backup. Hosted
+            execution, masking, and periodic local-source resync are not
+            current features.
+          </p>
+        </div>
+      </section>
+
+      <section class="cta shell section" aria-labelledby="cta-title">
+        <div class="cta-coordinate" aria-hidden="true">RBX / START HERE</div>
+        <p class="eyebrow">Build with us</p>
+        <h2 id="cta-title">Make the heavy part of local development remote.</h2>
+        <p>
+          Repobox is being built in the open. Explore the code, read the
+          current contract, or try it from source against a disposable project.
+        </p>
+        <div class="cta-command" role="group" aria-label="Primary Repobox command">
+          <span aria-hidden="true">$</span>
+          <code>repobox run</code>
+        </div>
+        <div class="hero-actions">
+          <a
+            class="button button-primary"
+            href="https://github.com/Sainapse-Inc/repobox"
+            rel="noreferrer"
+          >
+            Explore on GitHub
+            <span aria-hidden="true">↗</span>
+          </a>
+          <a
+            class="button button-secondary"
+            href="https://github.com/Sainapse-Inc/repobox/tree/main/docs"
+            rel="noreferrer"
+          >
+            Read the docs
+            <span aria-hidden="true">↗</span>
+          </a>
+        </div>
+      </section>
+    </main>
+
+    <footer class="site-footer">
+      <div class="shell footer-inner">
+        <div>
+          <a class="wordmark wordmark-small" href="/" aria-label="Repobox home">
+            <svg aria-hidden="true" viewBox="0 0 32 32">
+              <path d="M4 5h15v6H10v5h12v11H4z"></path>
+              <path class="wordmark-signal" d="M23 5h5v6h-5z"></path>
+            </svg>
+            <span>repobox</span>
+          </a>
+          <p>Local-first development with remote state.</p>
+        </div>
+        <div class="footer-meta">
+          <span>Built by Sainapse Inc.</span>
+          <span>MIT licensed</span>
+          <a href="https://github.com/Sainapse-Inc/repobox" rel="noreferrer">GitHub ↗</a>
+        </div>
+      </div>
+    </footer>
+  </body>
+</html>
