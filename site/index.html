@@ -8,7 +8,7 @@
       name="description"
       content="Repobox is an agent-native Rust CLI that keeps application code local while moving development Postgres into persistent, branch-scoped environments."
     >
-    <meta name="theme-color" content="#090c0b">
+    <meta name="theme-color" content="#f7f7f7">
     <meta property="og:title" content="Repobox — Local code. Persistent data.">
     <meta
       property="og:description"
@@ -16,18 +16,17 @@
     >
     <meta property="og:type" content="website">
     <link rel="icon" href="/favicon.svg" type="image/svg+xml">
-    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
     <link rel="stylesheet" href="/styles.css">
     <link
       rel="preload"
-      href="https://fonts.gstatic.com/s/barlowcondensed/v13/HTxwL3I-JCGChYJ8VI-L6OO_au7B47b1z3bWuQ.woff2"
+      href="/fonts/ronzino/Ronzino-Medium.woff2"
       as="font"
       type="font/woff2"
       crossorigin
     >
     <link
       rel="preload"
-      href="https://fonts.gstatic.com/s/ibmplexsans/v23/zYXzKVElMYYaJe8bpLHnCwDKr932-G7dytD-Dmu1syxeKYY.woff2"
+      href="/fonts/geist/Geist-Latin.woff2"
       as="font"
       type="font/woff2"
       crossorigin
@@ -38,12 +37,15 @@
 
     <header class="site-header">
       <nav class="nav shell" aria-label="Primary navigation">
-        <a class="wordmark" href="/" aria-label="Repobox home">
-          <svg aria-hidden="true" viewBox="0 0 32 32">
-            <path d="M4 5h15v6H10v5h12v11H4z"></path>
-            <path class="wordmark-signal" d="M23 5h5v6h-5z"></path>
-          </svg>
-          <span>repobox</span>
+        <a class="brand-lockup" href="/" aria-label="Repobox by Sainapse home">
+          <img
+            src="/sainapse-logo.svg"
+            alt=""
+            width="172"
+            height="37"
+          >
+          <span class="brand-separator" aria-hidden="true">/</span>
+          <span class="product-wordmark">repobox</span>
         </a>
 
         <div class="nav-status">
@@ -247,7 +249,7 @@
               </defs>
 
               <g class="repo-node">
-                <rect x="24" y="135" width="176" height="110" rx="2"></rect>
+                <rect x="24" y="135" width="176" height="110" rx="0"></rect>
                 <text x="48" y="170" class="svg-label">LOCAL REPOSITORY</text>
                 <text x="48" y="205" class="svg-title">my-app</text>
                 <text x="48" y="226" class="svg-meta">~/code/my-app</text>
@@ -258,7 +260,7 @@
               <g class="route route-main">
                 <path d="M286 190V72H485"></path>
                 <circle cx="286" cy="190" r="5"></circle>
-                <rect x="485" y="35" width="238" height="74" rx="2"></rect>
+                <rect x="485" y="35" width="238" height="74" rx="0"></rect>
                 <circle class="route-node" cx="692" cy="72" r="7"></circle>
                 <text x="509" y="66" class="svg-title">main</text>
                 <text x="509" y="88" class="svg-meta">persistent postgres</text>
@@ -266,7 +268,7 @@
 
               <g class="route route-feature">
                 <path d="M286 190H485"></path>
-                <rect x="485" y="153" width="238" height="74" rx="2"></rect>
+                <rect x="485" y="153" width="238" height="74" rx="0"></rect>
                 <circle class="route-node" cx="692" cy="190" r="7"></circle>
                 <text x="509" y="184" class="svg-title">feature/payments</text>
                 <text x="509" y="206" class="svg-meta">persistent postgres</text>
@@ -274,7 +276,7 @@
 
               <g class="route route-agent">
                 <path d="M286 190V308H485"></path>
-                <rect x="485" y="271" width="238" height="74" rx="2"></rect>
+                <rect x="485" y="271" width="238" height="74" rx="0"></rect>
                 <circle class="route-node" cx="692" cy="308" r="7"></circle>
                 <text x="509" y="302" class="svg-title">agent/refactor</text>
                 <text x="509" y="324" class="svg-meta">persistent postgres</text>
@@ -336,7 +338,7 @@
             </div>
           </article>
 
-          <article class="principle">
+          <article class="principle principle-agent">
             <div class="principle-index">B / AGENT-NATIVE</div>
             <h3>One interface for people and agents.</h3>
             <p>
@@ -441,17 +443,20 @@
     <footer class="site-footer">
       <div class="shell footer-inner">
         <div>
-          <a class="wordmark wordmark-small" href="/" aria-label="Repobox home">
-            <svg aria-hidden="true" viewBox="0 0 32 32">
-              <path d="M4 5h15v6H10v5h12v11H4z"></path>
-              <path class="wordmark-signal" d="M23 5h5v6h-5z"></path>
-            </svg>
-            <span>repobox</span>
+          <a class="brand-lockup brand-lockup-footer" href="/" aria-label="Repobox by Sainapse home">
+            <img
+              src="/sainapse-logo.svg"
+              alt=""
+              width="172"
+              height="37"
+            >
+            <span class="brand-separator" aria-hidden="true">/</span>
+            <span class="product-wordmark">repobox</span>
           </a>
           <p>Local-first development with remote state.</p>
         </div>
         <div class="footer-meta">
-          <span>Built by Sainapse Inc.</span>
+          <span>An open-source Sainapse project</span>
           <span>MIT licensed</span>
           <a href="https://github.com/Sainapse-Inc/repobox" rel="noreferrer">GitHub ↗</a>
         </div>
