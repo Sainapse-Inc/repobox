@@ -162,45 +162,98 @@ Never automate broad organization deletion from this runbook.
 - If credentials appear in output, stop immediately, revoke the OAuth access token, service token, and database role as applicable, preserve only redacted evidence, and block release.
 - If cleanup cannot be proven, do not tag a release. Record the exact provider resource IDs and resolve ownership first.
 
+### Import failure recovery
+
+For `bootstrap.mode: import`, distinguish a provider failure from the local
+stream symptom before retrying:
+
+1. Inspect the exact job and retain its redacted error.
+
+   ```sh
+   target/release/repobox --repo /absolute/path/to/fixture \
+     job view EXACT_UUID --json --no-input
+   ```
+
+2. If `planetscale_import_failed` contains an unexpected EOF, invalid socket,
+   or lost connection, check PlanetScale's restart reason and cluster logs. A
+   client-side broken pipe alone is not evidence of the root cause.
+3. For a confirmed out-of-memory restart, resize the existing base database
+   and wait until PlanetScale reports the resize complete. Also pin the chosen
+   SKU in `remote.cluster_size`; changing the config alone does not resize an
+   existing database.
+4. Resume the same job once.
+
+   ```sh
+   target/release/repobox --repo /absolute/path/to/fixture \
+     job resume EXACT_UUID --yes --json --no-input
+   ```
+
+5. If the controlled retry also restarts for out-of-memory, stop. Record the
+   failing table or widest serialized row if known, then choose a larger
+   cluster or contact PlanetScale support. Do not run an unbounded retry loop.
+
+Expected: `pg_dump` and `psql` have exited after every failure or cancellation,
+no `io.repobox.managed=psql` fallback container remains, the source Compose
+service retains its original running state, and the resumed job either succeeds
+or returns the provider diagnostic without exposing credentials.
+
+Repeat once with the source service initially stopped and a local `psql` older
+than version 16 (or absent). Expected: Repobox waits for `pg_isready`, uses the
+managed PostgreSQL 18 client for the PlanetScale connection, and restores the
+source service to stopped on success, failure, or cancellation.
+
+When the application does not use libpq, also start it through the real
+database adapter. Verify that the driver accepts PlanetScale's
+`sslrootcert=system` semantics or securely maps them to its native system trust
+store. A successful `psql` import alone does not prove application-driver TLS
+compatibility.
+
 ## Release evidence
 
-Record the Repobox commit, Rust version, Docker Compose version, provider organization (not credentials), timestamps, command exits, job IDs, request IDs, created resource IDs, cleanup confirmation, and any provider behavior that differed from the mocked wire tests.
+Store the Repobox commit, tool versions, timestamps, command exits, job IDs,
+request IDs, created resource IDs, cleanup confirmation, and provider behavior
+in an access-controlled release artifact. The public repository may retain a
+sanitized outcome and approximate timings, but never organization names,
+project or database names, job or request IDs, branch or backup IDs, private
+application identifiers, table names, row counts, or data digests.
 
-### Diagnostic run: 2026-07-22
+### Sanitized historical diagnostic
 
-This run exercised the pre-release build at commit
-`4ffe5c9306332e37aaa91b4ff1f30b69ba1af546`. It is diagnostic evidence, not a
-passing release gate.
+A pre-release disposable lifecycle run found that provider database, backup,
+and branch transitions can exceed ten minutes. Exact resume recovered pending
+resources, but the run also exposed role-identity and confirmation defects.
+Cleanup removed the disposable provider and Docker resources. The result was a
+failed release gate; the repository keeps only this sanitized summary while the
+identifier-bearing evidence remains in the private release record.
 
-- Toolchain: Rust/Cargo 1.97.1, Docker 29.5.1, Docker Compose v5.1.3, and
-  Repobox 0.1.0.
-- Scope: the personal PlanetScale organization `abhirup-ghosh`; the `sainapse`
-  organization was not selected or mutated.
-- Fixture: project `repobox-live-smoke-oxka1s`, project ID
-  `14094572-c57f-492d-84e6-001fe9dd1513`, database
-  `repobox-live-smoke-oxka1s-db`, and environment `smoke/main`.
-- Initial create job `019f885e-71d6-7d52-a7d8-5c624df1d9b2` resumed after a
-  billing-verification response (`9d449a14-f35b-4d52-aa4e-2eb776860f58`). The
-  database became ready in about 8.5 minutes. Backup `irnl7rylgwhd` completed
-  in about 5.3 minutes, and canonical branch `coil9acn68ac` became ready in
-  about 8.3 minutes. The resumed job succeeded on attempt two.
-- Idempotence job `019f88c6-6013-7393-b267-6925ddaf71c2` reused the canonical
-  branch and role. `repobox run` skipped the local PostgreSQL service, started
-  only the local application service, injected nonempty database URLs, and
-  stopped it cleanly on Ctrl-C without printing credentials.
-- Pull job `019f88c8-b967-76d2-bed1-90e7ea70c68a` created staging branch
-  `32immzta0xve`. The branch took about 11.9 minutes to become ready, exceeding
-  the then-hard-coded ten-minute readiness budget. Resuming the exact job
-  completed the forward-only swap, leaving one canonical environment branch.
-- Partial-failure job `019f88d8-5d93-7683-b4c3-69984683625a` retained the
-  successful `db` binding and reported the failing service plus provider
-  request ID `14000b44-be75-472f-8672-2ea6dd0384ef`. A subsequent create found
-  that pull had used a staging-derived role identity and created a second role.
-- Cleanup job `019f88da-5e4f-7250-9b34-ba9630c66991` deleted the environment.
-  The exact smoke database was then deleted explicitly. Final provider checks
-  showed no databases in `abhirup-ghosh`, and Docker showed no smoke container.
+### Private application import validation: 2026-07-23
 
-Verdict: **failed release gate**. Before tagging, Repobox must tolerate observed
-provider readiness times, reuse pending resources during resume, preserve a
-canonical role identity across pull, enforce confirmation on job resume, and
-pass this live lifecycle again from the release candidate commit.
+This run validated the import and native-runtime paths against a real,
+multi-gigabyte private application database. Exact application names,
+provider resource IDs, table names, counts, and digests are intentionally
+omitted from this public repository. The private durable job and provider
+records retain the audit trail. This is application-pilot evidence, not a
+replacement for the disposable lifecycle release gate above.
+
+- Two smaller target sizes restarted for out-of-memory while restoring wide
+  JSONB rows. After the existing database was resized to PS-20, resuming the
+  same durable job completed the logical restore without another OOM restart.
+- Source and target matched on schema shape, migrations, application reference
+  data, stable per-table row counts, and a digest of those counts. Subsequent
+  local drift was confined to tables receiving new source writes after the
+  snapshot.
+- The application's real async database adapter connected with certificate and
+  hostname verification, compiled its database-backed registry, and completed
+  a temporary write/read/delete transaction with zero persistent test rows.
+- `repobox run` started both the backend and frontend against the remote branch.
+  Their isolated health endpoints returned HTTP 200 while background workers,
+  caching, scheduled sync, and synthetic probes were disabled for the pilot.
+- Ctrl-C returned exit zero only after `runtime_stopped`. Both isolated ports
+  were free afterward, no pilot Python, Node, frontend, or Repobox process
+  remained, and the original local PostgreSQL container remained running with
+  zero restarts.
+
+The PS-20 database, environment branch, role, and import backup are intentionally
+retained for continued private pilot testing and remain billable. Remove the
+exact resources recorded by the durable job when the pilot ends; do not run broad
+organization cleanup.

@@ -1,8 +1,11 @@
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::{self, IsTerminal, Read, Write};
+#[cfg(unix)]
+use std::os::unix::process::ExitStatusExt;
 use std::path::Path;
 use std::process::Stdio;
+use std::time::Duration;
 
 use chrono::Utc;
 use clap::CommandFactory;
@@ -30,21 +33,67 @@ use crate::cli::{
 use crate::context::{ProjectContext, requested_repository};
 use crate::credentials::CredentialStore;
 use crate::environment::{
-    EnvironmentManager, ProvisionOptions, environment_variables, job_store, state_for_environment,
-    state_store, stored_environment_variables,
+    EnvironmentManager, OperationCancellation, ProvisionOptions, environment_variables,
+    guard_run_against_unresolved_mutation, job_store, state_for_environment, state_store,
+    stored_environment_variables,
 };
 use crate::initialize;
 use crate::output::Output;
 use crate::tui::{DashboardEvent, DashboardOptions};
 
-pub async fn run(cli: Cli, output: &Output) -> Result<()> {
+const NATIVE_RUNTIME_SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(10);
+const FOREGROUND_SIGNAL_PROPAGATION_GRACE_PERIOD: Duration = Duration::from_millis(50);
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RuntimeChildControl {
+    Immediate,
+    NativeForeground,
+    NativeIsolated,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum InterruptDelivery {
+    Forward,
+    ForegroundAlreadySignaled,
+}
+
+impl RuntimeChildControl {
+    fn isolates_process_group(self) -> bool {
+        matches!(self, Self::NativeIsolated)
+    }
+
+    fn supports_graceful_interrupt(self) -> bool {
+        cfg!(unix) && !matches!(self, Self::Immediate)
+    }
+}
+
+fn native_child_control(interactive: bool, structured_output: bool) -> RuntimeChildControl {
+    if interactive && !structured_output {
+        RuntimeChildControl::NativeForeground
+    } else {
+        RuntimeChildControl::NativeIsolated
+    }
+}
+
+fn native_inherits_stdin(interactive: bool, structured_output: bool) -> bool {
+    interactive && !structured_output
+}
+
+#[cfg(unix)]
+fn configure_native_process_group(command: &mut TokioCommand, control: RuntimeChildControl) {
+    if control.isolates_process_group() {
+        command.process_group(0);
+    }
+}
+
+pub async fn run(cli: Cli, output: &Output, cancellation: &OperationCancellation) -> Result<()> {
     maybe_update_notice(&cli, output).await;
     let repository = requested_repository(cli.repo.as_ref())?;
     match cli.command.clone().expect("main checks for a command") {
         Command::Init(args) => init(&cli, output, &repository, &args).await,
-        Command::Run(args) => run_project(&cli, output, &repository, &args).await,
+        Command::Run(args) => run_project(&cli, output, &repository, &args, cancellation).await,
         Command::Stop(selector) => stop_project(&cli, output, &repository, &selector).await,
-        Command::Pull(args) => pull(&cli, output, &repository, &args).await,
+        Command::Pull(args) => pull(&cli, output, &repository, &args, cancellation).await,
         Command::Status(selector) => {
             status(output, &repository, selector.environment.as_deref()).await
         }
@@ -60,9 +109,11 @@ pub async fn run(cli: Cli, output: &Output) -> Result<()> {
             .await
         }
         Command::Auth(command) => auth(&cli, output, command).await,
-        Command::Env(command) => environment(&cli, output, &repository, command).await,
+        Command::Env(command) => {
+            environment(&cli, output, &repository, command, cancellation).await
+        }
         Command::Service(command) => service(&cli, output, &repository, command).await,
-        Command::Job(command) => jobs(&cli, output, &repository, command).await,
+        Command::Job(command) => jobs(&cli, output, &repository, command, cancellation).await,
         Command::Config(command) => config(&cli, output, &repository, command).await,
         Command::Telemetry(command) => telemetry(&cli, output, command),
         Command::Update(args) => update(&cli, output, args.check).await,
@@ -231,6 +282,7 @@ async fn run_project(
     output: &Output,
     repository: &Path,
     args: &crate::cli::RunArgs,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     let mut context = match ProjectContext::load(repository) {
         Ok(context) => context,
@@ -259,6 +311,11 @@ async fn run_project(
     let credentials = credential_store(&context.paths);
     let project_state_store = state_store(&context.config, &context.paths);
     let existing = project_state_store.load(context.config.project.id)?;
+    guard_run_against_unresolved_mutation(
+        &job_store(&context.config, &context.paths),
+        context.config.project.id,
+        &environment,
+    )?;
     let ready = existing
         .environments
         .get(&environment)
@@ -295,7 +352,8 @@ async fn run_project(
             project_state_store,
             job_store(&context.config, &context.paths),
             output,
-        );
+        )
+        .with_cancellation(cancellation.clone());
         manager.ensure(&environment, &options).await?;
     }
     // Reload after provisioning so runtime receives the durable binding.
@@ -330,15 +388,15 @@ async fn run_project(
                     )
                 }
             } else if output.json() {
-                run_compose_json(output, &runtime, &variables, &environment).await
+                run_compose_json(output, &runtime, &variables, &environment, cancellation).await
             } else if args.no_tui || !io::stderr().is_terminal() {
-                run_compose_plain(output, &runtime, &variables).await
+                run_compose_plain(output, &runtime, &variables, &environment, cancellation).await
             } else {
                 runtime.start(&variables, true).await?;
                 let dashboard_result =
-                    dashboard(&runtime, &context, &environment, &variables).await;
+                    dashboard(&runtime, &context, &environment, &variables, cancellation).await;
                 let stop_result = runtime.stop().await;
-                dashboard_result.and(stop_result)
+                finish_compose_shutdown(dashboard_result, stop_result, cancellation, &environment)
             }
         }
         RuntimeConfig::Native { native } => {
@@ -364,6 +422,10 @@ async fn run_project(
                 .args(arguments)
                 .current_dir(context.repository.join(&native.working_directory))
                 .envs(&variables);
+            command.kill_on_drop(true);
+            let child_control = native_child_control(native.interactive, output.json());
+            #[cfg(unix)]
+            configure_native_process_group(&mut command, child_control);
             if output.json() {
                 let child = command
                     .stdin(Stdio::null())
@@ -384,6 +446,8 @@ async fn run_project(
                         failure_code: "native_runtime_failed",
                         process_label: "native runtime",
                         redactor: runtime_redactor(&variables),
+                        cancellation: Some(cancellation.clone()),
+                        child_control,
                     },
                 )
                 .await?;
@@ -392,12 +456,20 @@ async fn run_project(
                     &serde_json::json!({"environment": environment, "runtime": "native"}),
                 );
             }
-            let status = command
-                .stdin(Stdio::inherit())
+            let child = command
+                .stdin(if native_inherits_stdin(native.interactive, false) {
+                    Stdio::inherit()
+                } else {
+                    Stdio::null()
+                })
                 .stdout(Stdio::inherit())
                 .stderr(Stdio::inherit())
-                .status()
-                .await?;
+                .spawn()?;
+            let (status, interrupted) =
+                wait_native_runtime_child(child, cancellation, child_control).await?;
+            if interrupted {
+                return Ok(());
+            }
             if status.success() {
                 Ok(())
             } else {
@@ -416,6 +488,7 @@ async fn dashboard(
     context: &ProjectContext,
     environment: &str,
     variables: &BTreeMap<String, String>,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     let redactor = runtime_redactor(variables);
     let mut child = runtime.spawn_logs(None, true, 200)?;
@@ -467,15 +540,19 @@ async fn dashboard(
         .into_iter()
         .map(|service| service.name)
         .collect();
-    crate::tui::run_dashboard(
+    let dashboard = crate::tui::run_dashboard(
         DashboardOptions {
             project: context.config.project.name.clone(),
             environment: environment.to_owned(),
             services,
         },
         receiver,
-    )
-    .await
+    );
+    tokio::select! {
+        biased;
+        () = cancellation.cancelled() => Ok(()),
+        result = dashboard => result,
+    }
 }
 
 async fn run_compose_json(
@@ -483,6 +560,7 @@ async fn run_compose_json(
     runtime: &ComposeRuntime,
     variables: &BTreeMap<String, String>,
     environment: &str,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     runtime.start_quiet(variables).await?;
     output.stream(
@@ -500,6 +578,8 @@ async fn run_compose_json(
             failure_code: "compose_logs_failed",
             process_label: "Docker Compose logs",
             redactor: runtime_redactor(variables),
+            cancellation: Some(cancellation.clone()),
+            child_control: RuntimeChildControl::Immediate,
         },
     )
     .await;
@@ -510,13 +590,15 @@ async fn run_compose_json(
             &serde_json::json!({"environment": environment, "runtime": "compose"}),
         )?;
     }
-    logs_result.and(stop_result)
+    finish_compose_shutdown(logs_result, stop_result, cancellation, environment)
 }
 
 async fn run_compose_plain(
     output: &Output,
     runtime: &ComposeRuntime,
     variables: &BTreeMap<String, String>,
+    environment: &str,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     runtime.start(variables, true).await?;
     let child = runtime.spawn_logs(None, true, 200)?;
@@ -530,11 +612,43 @@ async fn run_compose_plain(
             failure_code: "compose_logs_failed",
             process_label: "Docker Compose logs",
             redactor: runtime_redactor(variables),
+            cancellation: Some(cancellation.clone()),
+            child_control: RuntimeChildControl::Immediate,
         },
     )
     .await;
     let stop_result = runtime.stop().await;
-    logs_result.and(stop_result)
+    finish_compose_shutdown(logs_result, stop_result, cancellation, environment)
+}
+
+fn finish_compose_shutdown(
+    run_result: Result<()>,
+    stop_result: Result<()>,
+    cancellation: &OperationCancellation,
+    environment: &str,
+) -> Result<()> {
+    match stop_result {
+        Ok(()) => run_result,
+        Err(stop_error) if cancellation.is_cancelled() => {
+            let request_id = stop_error.request_id.clone();
+            let mut error = RepoboxError::new(
+                ErrorKind::Runtime,
+                "operation_interrupted_cleanup_incomplete",
+                format!(
+                    "operation interrupted, but stopping Docker Compose for environment `{environment}` failed; Compose services may remain running ({}: {})",
+                    stop_error.code, stop_error.message
+                ),
+            )
+            .with_suggestion(format!(
+                "Inspect `docker compose ps` and stop the services for `{environment}` before running Repobox again."
+            ));
+            if let Some(request_id) = request_id {
+                error = error.with_request_id(request_id);
+            }
+            Err(error)
+        }
+        Err(stop_error) => Err(stop_error),
+    }
 }
 
 async fn status(output: &Output, repository: &Path, explicit: Option<&str>) -> Result<()> {
@@ -603,6 +717,8 @@ async fn logs(
             failure_code: "compose_logs_failed",
             process_label: "Docker Compose logs",
             redactor: runtime_redactor(&variables),
+            cancellation: None,
+            child_control: RuntimeChildControl::Immediate,
         },
     )
     .await
@@ -615,15 +731,306 @@ struct LogStreamOptions {
     failure_code: &'static str,
     process_label: &'static str,
     redactor: repobox_core::redaction::SecretRedactor,
+    cancellation: Option<OperationCancellation>,
+    child_control: RuntimeChildControl,
+}
+
+struct ManagedRuntimeChild {
+    child: tokio::process::Child,
+    #[cfg(unix)]
+    process_group: Option<nix::unistd::Pid>,
+    control: RuntimeChildControl,
+    active: bool,
+}
+
+impl ManagedRuntimeChild {
+    fn new(child: tokio::process::Child, control: RuntimeChildControl) -> Self {
+        #[cfg(unix)]
+        let process_group = control
+            .isolates_process_group()
+            .then(|| child.id())
+            .flatten()
+            .and_then(|id| i32::try_from(id).ok())
+            .map(nix::unistd::Pid::from_raw);
+        Self {
+            child,
+            #[cfg(unix)]
+            process_group,
+            control,
+            active: true,
+        }
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.active = false;
+        #[cfg(unix)]
+        {
+            self.process_group = None;
+        }
+        Ok(status)
+    }
+
+    #[cfg(unix)]
+    fn signal_process_group(&self, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+        let Some(process_group) = self.process_group else {
+            return Ok(());
+        };
+        match nix::sys::signal::killpg(process_group, signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    #[cfg(unix)]
+    fn signal_child(&self, signal: nix::sys::signal::Signal) -> std::io::Result<()> {
+        let Some(pid) = self
+            .child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .map(nix::unistd::Pid::from_raw)
+        else {
+            return Ok(());
+        };
+        match nix::sys::signal::kill(pid, signal) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    fn send_graceful_interrupt(&mut self) -> std::io::Result<bool> {
+        if !self.control.supports_graceful_interrupt() {
+            self.child.start_kill()?;
+            return Ok(false);
+        }
+        #[cfg(unix)]
+        {
+            match self.control {
+                RuntimeChildControl::NativeIsolated => {
+                    self.signal_process_group(nix::sys::signal::Signal::SIGINT)?;
+                    return Ok(true);
+                }
+                RuntimeChildControl::NativeForeground => {
+                    self.signal_child(nix::sys::signal::Signal::SIGINT)?;
+                    return Ok(true);
+                }
+                RuntimeChildControl::Immediate => {}
+            }
+        }
+        debug_assert!(!self.control.supports_graceful_interrupt());
+        self.child.start_kill()?;
+        Ok(false)
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        #[cfg(unix)]
+        if self.control.isolates_process_group() {
+            self.signal_process_group(nix::sys::signal::Signal::SIGKILL)?;
+        }
+        match self.child.start_kill() {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result,
+        }
+    }
+}
+
+impl Drop for ManagedRuntimeChild {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        #[cfg(unix)]
+        if self.control.isolates_process_group() {
+            let _ = self.signal_process_group(nix::sys::signal::Signal::SIGKILL);
+        }
+        let _ = self.child.start_kill();
+    }
+}
+
+async fn stop_interrupted_runtime(
+    child: &mut ManagedRuntimeChild,
+    delivery: InterruptDelivery,
+) -> Result<(std::process::ExitStatus, bool)> {
+    let control = child.control;
+    let graceful = match delivery {
+        InterruptDelivery::Forward => child.send_graceful_interrupt().map_err(|error| {
+            native_runtime_cleanup_io_error(control, "deliver interrupt", error)
+        })?,
+        InterruptDelivery::ForegroundAlreadySignaled => {
+            debug_assert_eq!(child.control, RuntimeChildControl::NativeForeground);
+            true
+        }
+    };
+    if graceful {
+        if let Ok(status) =
+            tokio::time::timeout(NATIVE_RUNTIME_SHUTDOWN_GRACE_PERIOD, child.wait()).await
+        {
+            return status
+                .map(|status| (status, false))
+                .map_err(|error| native_runtime_cleanup_io_error(control, "reap child", error));
+        }
+        child
+            .start_kill()
+            .map_err(|error| native_runtime_cleanup_io_error(control, "force-stop child", error))?;
+        let status = child.wait().await.map_err(|error| {
+            native_runtime_cleanup_io_error(control, "reap forced child", error)
+        })?;
+        return Ok((status, true));
+    }
+    let status = child
+        .wait()
+        .await
+        .map_err(|error| native_runtime_cleanup_io_error(control, "reap child", error))?;
+    Ok((status, false))
+}
+
+async fn foreground_ctrl_c(control: RuntimeChildControl) -> std::io::Result<()> {
+    if control == RuntimeChildControl::NativeForeground {
+        tokio::signal::ctrl_c().await
+    } else {
+        std::future::pending::<std::io::Result<()>>().await
+    }
+}
+
+async fn wait_native_runtime_child(
+    child: tokio::process::Child,
+    cancellation: &OperationCancellation,
+    control: RuntimeChildControl,
+) -> Result<(std::process::ExitStatus, bool)> {
+    let mut child = ManagedRuntimeChild::new(child, control);
+    let foreground_signal = foreground_ctrl_c(control);
+    tokio::pin!(foreground_signal);
+    tokio::select! {
+        biased;
+        signal = &mut foreground_signal => {
+            signal.map_err(|error| {
+                native_runtime_cleanup_io_error(control, "observe foreground Ctrl-C", error)
+            })?;
+            let (status, forced) = stop_interrupted_runtime(
+                &mut child,
+                InterruptDelivery::ForegroundAlreadySignaled,
+            ).await?;
+            if forced {
+                return Err(native_runtime_forced_cleanup_incomplete(control));
+            }
+            Ok((status, true))
+        }
+        () = cancellation.cancelled() => {
+            let delivery = if control == RuntimeChildControl::NativeForeground {
+                match tokio::time::timeout(
+                    FOREGROUND_SIGNAL_PROPAGATION_GRACE_PERIOD,
+                    &mut foreground_signal,
+                ).await {
+                    Ok(signal) => {
+                        signal.map_err(|error| {
+                            native_runtime_cleanup_io_error(
+                                control,
+                                "observe foreground Ctrl-C",
+                                error,
+                            )
+                        })?;
+                        InterruptDelivery::ForegroundAlreadySignaled
+                    }
+                    Err(_) => InterruptDelivery::Forward,
+                }
+            } else {
+                InterruptDelivery::Forward
+            };
+            let (status, forced) =
+                stop_interrupted_runtime(&mut child, delivery).await?;
+            if forced {
+                return Err(native_runtime_forced_cleanup_incomplete(control));
+            }
+            Ok((status, true))
+        }
+        status = child.wait() => {
+            let status = status?;
+            let interrupted = native_foreground_status_was_interrupted(status, control);
+            Ok((status, interrupted))
+        },
+    }
+}
+
+fn native_foreground_status_was_interrupted(
+    status: std::process::ExitStatus,
+    control: RuntimeChildControl,
+) -> bool {
+    if control != RuntimeChildControl::NativeForeground {
+        return false;
+    }
+    #[cfg(unix)]
+    {
+        status.signal() == Some(nix::libc::SIGINT) || status.code() == Some(128 + nix::libc::SIGINT)
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
+fn native_runtime_cleanup_io_error(
+    control: RuntimeChildControl,
+    action: &str,
+    error: std::io::Error,
+) -> RepoboxError {
+    let cleanup_target = if cfg!(unix) && control.isolates_process_group() {
+        "isolated process-group cleanup"
+    } else {
+        "child-process cleanup"
+    };
+    native_runtime_cleanup_incomplete(
+        format!("failed to {action} during interruption: {error}"),
+        format!("{cleanup_target} could not be confirmed"),
+    )
+}
+
+fn native_runtime_forced_cleanup_incomplete(control: RuntimeChildControl) -> RepoboxError {
+    let forced_cleanup = if cfg!(unix) && control.isolates_process_group() {
+        "its process group was killed"
+    } else {
+        "the child process was killed"
+    };
+    native_runtime_cleanup_incomplete(
+        format!(
+            "native runtime did not exit within {} seconds",
+            NATIVE_RUNTIME_SHUTDOWN_GRACE_PERIOD.as_secs()
+        ),
+        forced_cleanup,
+    )
+}
+
+fn native_runtime_cleanup_incomplete(
+    detail: impl std::fmt::Display,
+    cleanup_outcome: impl std::fmt::Display,
+) -> RepoboxError {
+    RepoboxError::new(
+        ErrorKind::Runtime,
+        "native_runtime_cleanup_incomplete",
+        format!(
+            "{detail}; {cleanup_outcome}, and independently detached descendants may remain",
+        ),
+    )
+    .with_suggestion(
+        "Inspect the native command's descendants and listening ports before running Repobox again.",
+    )
+}
+
+async fn cancellation_requested(cancellation: Option<&OperationCancellation>) {
+    if let Some(cancellation) = cancellation {
+        cancellation.cancelled().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
 }
 
 async fn stream_log_child(
     output: &Output,
-    mut child: tokio::process::Child,
+    child: tokio::process::Child,
     options: LogStreamOptions,
 ) -> Result<()> {
-    let stdout = child.stdout.take().expect("logs stdout is piped");
-    let stderr = child.stderr.take().expect("logs stderr is piped");
+    let mut child = ManagedRuntimeChild::new(child, options.child_control);
+    let stdout = child.child.stdout.take().expect("logs stdout is piped");
+    let stderr = child.child.stderr.take().expect("logs stderr is piped");
     let (sender, mut receiver) = mpsc::unbounded_channel::<(bool, String)>();
     let stdout_sender = sender.clone();
     tokio::spawn(async move {
@@ -650,6 +1057,10 @@ async fn stream_log_child(
                 value = receiver.recv() => value,
                 signal = tokio::signal::ctrl_c() => {
                     signal?;
+                    interrupted = true;
+                    None
+                }
+                () = cancellation_requested(options.cancellation.as_ref()) => {
                     interrupted = true;
                     None
                 }
@@ -685,10 +1096,16 @@ async fn stream_log_child(
         }
     }
 
-    if interrupted {
-        let _ = child.start_kill();
+    let (status, forced) = if interrupted {
+        stop_interrupted_runtime(&mut child, InterruptDelivery::Forward).await?
+    } else {
+        (child.wait().await?, false)
+    };
+    if forced {
+        return Err(native_runtime_forced_cleanup_incomplete(
+            options.child_control,
+        ));
     }
-    let status = child.wait().await?;
     if interrupted || status.success() {
         Ok(())
     } else {
@@ -979,6 +1396,7 @@ async fn environment(
     output: &Output,
     repository: &Path,
     command: EnvCommand,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     let context = ProjectContext::load(repository)?;
     let credentials = credential_store(&context.paths);
@@ -1020,7 +1438,8 @@ async fn environment(
                 state_store(&context.config, &context.paths),
                 job_store(&context.config, &context.paths),
                 output,
-            );
+            )
+            .with_cancellation(cancellation.clone());
             confirm(
                 cli,
                 &format!("Create billable PlanetScale data for `{name}`?"),
@@ -1048,14 +1467,17 @@ async fn environment(
                 ),
             )?;
             if cli.dry_run {
-                return output.data(
-                    "env delete",
-                    &serde_json::json!({
-                        "environment": args.name,
-                        "operation": "delete_provider_branches",
-                        "executed": false,
-                    }),
+                let provider = planning_provider()?;
+                let manager = EnvironmentManager::new(
+                    &context.config,
+                    &context.repository,
+                    &provider,
+                    &credentials,
+                    state_store(&context.config, &context.paths),
+                    job_store(&context.config, &context.paths),
+                    output,
                 );
+                return output.data("env delete", &manager.delete_plan(&args.name)?);
             }
             let provider = provider(&credentials)?;
             let mut manager = EnvironmentManager::new(
@@ -1066,7 +1488,8 @@ async fn environment(
                 state_store(&context.config, &context.paths),
                 job_store(&context.config, &context.paths),
                 output,
-            );
+            )
+            .with_cancellation(cancellation.clone());
             let mutation = manager.delete(&args.name, args.keep_state).await?;
             output.mutation(
                 "env delete",
@@ -1115,10 +1538,9 @@ async fn environment(
                 state_store(&context.config, &context.paths),
                 job_store(&context.config, &context.paths),
                 output,
-            );
-            for target in &targets {
-                manager.delete(target, false).await?;
-            }
+            )
+            .with_cancellation(cancellation.clone());
+            manager.delete_many(&targets).await?;
             output.mutation(
                 "env prune",
                 &serde_json::json!({"deleted": targets}),
@@ -1209,7 +1631,13 @@ async fn service(
     }
 }
 
-async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand) -> Result<()> {
+async fn jobs(
+    cli: &Cli,
+    output: &Output,
+    repository: &Path,
+    command: JobCommand,
+    cancellation: &OperationCancellation,
+) -> Result<()> {
     let context = ProjectContext::load(repository)?;
     let store = job_store(&context.config, &context.paths);
     match command {
@@ -1309,7 +1737,8 @@ async fn jobs(cli: &Cli, output: &Output, repository: &Path, command: JobCommand
                 state_store(&context.config, &context.paths),
                 store,
                 output,
-            );
+            )
+            .with_cancellation(cancellation.clone());
             match job.kind {
                 JobKind::EnvironmentCreate => {
                     if cli.dry_run {
@@ -1683,6 +2112,8 @@ fn completion(output: &Output, shell: CompletionShell) -> Result<()> {
 
 async fn agent_context(output: &Output, repository: &Path, schemas: bool) -> Result<()> {
     let context = ProjectContext::load(repository).ok();
+    let (runtime_driver, detach_supported, recommended_run) =
+        agent_runtime_guidance(context.as_ref().map(|context| &context.config));
     let project = if let Some(context) = &context {
         let environment = context.environment(None).await.ok();
         let state = state_store(&context.config, &context.paths)
@@ -1730,8 +2161,15 @@ async fn agent_context(output: &Output, repository: &Path, schemas: bool) -> Res
             "repobox auth status --json --no-input",
             "repobox config detect --json",
             "repobox status --json",
-            "repobox run --detach --yes --json --no-input"
+            recommended_run
         ],
+        "runtime_guidance": {
+            "driver": runtime_driver,
+            "detach_supported": detach_supported,
+            "run_command": recommended_run,
+            "interrupt": "Ctrl-C requests bounded cleanup and waits for managed runtime shutdown"
+        },
+        "database_connection": database_connection_guidance(),
         "commands": command_manifest(&Cli::command()),
         "output_schema_refs": {
             "success": "docs/schemas/success-v1.json",
@@ -1756,6 +2194,38 @@ async fn agent_context(output: &Output, repository: &Path, schemas: bool) -> Res
         "schemas": schemas.then(contract_schemas),
     });
     output.data("agent-context", &data)
+}
+
+fn agent_runtime_guidance(config: Option<&RepoboxConfig>) -> (&'static str, bool, &'static str) {
+    match config.map(|config| &config.runtime) {
+        Some(RuntimeConfig::Compose { .. }) => (
+            "compose",
+            true,
+            "repobox run --detach --yes --json --no-input",
+        ),
+        Some(RuntimeConfig::Native { .. }) => (
+            "native",
+            false,
+            "repobox run --yes --json --no-input --no-tui",
+        ),
+        None => (
+            "unknown",
+            false,
+            "repobox run --yes --json --no-input --no-tui",
+        ),
+    }
+}
+
+fn database_connection_guidance() -> serde_json::Value {
+    serde_json::json!({
+        "url_profile": "libpq-16",
+        "tls_mode": "verify-full",
+        "trust": "system",
+        "help_command": "repobox help connections --json",
+        "known_adapters": {
+            "asyncpg": "pass ssl=True when constructing the connection or pool"
+        }
+    })
 }
 
 fn contract_schemas() -> serde_json::Value {
@@ -1817,6 +2287,10 @@ fn help(output: &Output, args: &HelpArgs) -> Result<()> {
             "data",
             "Every Git branch, including main, maps deterministically to a separate PlanetScale branch restored from the latest successful base backup. `repobox pull` replaces environment-local data.",
         ),
+        "connections" => (
+            "connections",
+            "PlanetScale URLs use `sslmode=verify-full&sslrootcert=system`; preserve hostname and certificate verification. Local `psql` must be version 16 or newer, otherwise Repobox uses its managed PostgreSQL 18 client. `asyncpg` treats `system` as a filename unless the application passes `ssl=True` when constructing the connection or pool. Never print an injected URL or downgrade TLS to make a driver parse it.",
+        ),
         "environments" => (
             "environments",
             "Use `repobox env list`, `env create`, `env delete`, and `env prune --fetch`. Cleanup is explicit; merged branches are only suggested until prune is approved.",
@@ -1844,7 +2318,7 @@ fn help(output: &Output, args: &HelpArgs) -> Result<()> {
                 format!("unknown help topic `{unknown}`"),
             )
             .with_suggestion(
-                "Available topics: setup, agents, data, environment, environments, formatting, config, exit-codes.",
+                "Available topics: setup, agents, data, connections, environment, environments, formatting, config, exit-codes.",
             ));
         }
     };
@@ -1860,6 +2334,7 @@ async fn pull(
     output: &Output,
     repository: &Path,
     args: &crate::cli::PullArgs,
+    cancellation: &OperationCancellation,
 ) -> Result<()> {
     let context = ProjectContext::load(repository)?;
     let environment = context
@@ -1912,7 +2387,8 @@ async fn pull(
         state_store(&context.config, &context.paths),
         job_store(&context.config, &context.paths),
         output,
-    );
+    )
+    .with_cancellation(cancellation.clone());
     let mutation = manager.pull(&environment, &options).await?;
     if restart {
         let state = state_store(&context.config, &context.paths).load(context.config.project.id)?;
@@ -2163,10 +2639,24 @@ fn read_telemetry(path: &Path) -> Result<bool> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::path::PathBuf;
+    #[cfg(target_os = "linux")]
+    use std::process::Stdio;
+    #[cfg(target_os = "linux")]
+    use std::time::Duration;
 
+    use repobox_core::config::{NativeConfig, RepoboxConfig, RuntimeConfig};
     use repobox_core::{ErrorKind, RepoboxError};
+    #[cfg(target_os = "linux")]
+    use tokio::process::Command as TokioCommand;
 
-    use super::{AuthPending, compose_runtime_variables};
+    use super::{
+        AuthPending, OperationCancellation, RuntimeChildControl, agent_runtime_guidance,
+        compose_runtime_variables, database_connection_guidance, finish_compose_shutdown,
+        native_child_control, native_inherits_stdin, native_runtime_cleanup_io_error,
+    };
+    #[cfg(target_os = "linux")]
+    use super::{configure_native_process_group, wait_native_runtime_child};
 
     #[test]
     fn auth_pending_contains_only_public_handoff_values() {
@@ -2222,5 +2712,236 @@ mod tests {
                 .code,
             "credential_decode_failed"
         );
+    }
+
+    #[test]
+    fn interactive_native_human_output_stays_in_foreground_process_group() {
+        assert_eq!(
+            native_child_control(true, false),
+            RuntimeChildControl::NativeForeground
+        );
+        assert_eq!(
+            native_child_control(true, true),
+            RuntimeChildControl::NativeIsolated
+        );
+        assert_eq!(
+            native_child_control(false, false),
+            RuntimeChildControl::NativeIsolated
+        );
+        assert!(native_inherits_stdin(true, false));
+        assert!(!native_inherits_stdin(false, false));
+        assert!(!native_inherits_stdin(true, true));
+    }
+
+    #[test]
+    fn child_control_graceful_signal_capability_is_platform_accurate() {
+        assert!(!RuntimeChildControl::Immediate.supports_graceful_interrupt());
+        assert_eq!(
+            RuntimeChildControl::NativeForeground.supports_graceful_interrupt(),
+            cfg!(unix)
+        );
+        assert_eq!(
+            RuntimeChildControl::NativeIsolated.supports_graceful_interrupt(),
+            cfg!(unix)
+        );
+    }
+
+    #[test]
+    fn native_interruption_io_failure_preserves_cleanup_diagnostic() {
+        let error = native_runtime_cleanup_io_error(
+            RuntimeChildControl::NativeIsolated,
+            "reap forced child",
+            std::io::Error::other("waitpid failed"),
+        );
+
+        assert_eq!(error.code, "native_runtime_cleanup_incomplete");
+        assert!(error.message.contains("reap forced child"));
+        assert!(error.message.contains("waitpid failed"));
+        assert!(error.message.contains("cleanup could not be confirmed"));
+    }
+
+    #[test]
+    fn agent_runtime_guidance_uses_detach_only_for_compose() {
+        let compose = RepoboxConfig::new_compose("compose", vec![PathBuf::from("compose.yml")]);
+        let (_, detach_supported, command) = agent_runtime_guidance(Some(&compose));
+        assert!(detach_supported);
+        assert!(command.contains("--detach"));
+
+        let mut native = compose;
+        native.runtime = RuntimeConfig::Native {
+            native: NativeConfig {
+                command: vec!["cargo".to_owned(), "run".to_owned()],
+                interactive: true,
+                working_directory: PathBuf::from("."),
+            },
+        };
+        let (driver, detach_supported, command) = agent_runtime_guidance(Some(&native));
+        assert_eq!(driver, "native");
+        assert!(!detach_supported);
+        assert!(command.contains("--no-tui"));
+        assert!(!command.contains("--detach"));
+    }
+
+    #[test]
+    fn database_connection_guidance_is_secure_and_actionable() {
+        let guidance = database_connection_guidance();
+        assert_eq!(guidance["url_profile"], "libpq-16");
+        assert_eq!(guidance["tls_mode"], "verify-full");
+        assert_eq!(guidance["trust"], "system");
+        assert_eq!(
+            guidance["known_adapters"]["asyncpg"],
+            "pass ssl=True when constructing the connection or pool"
+        );
+        assert_eq!(guidance["help_command"], "repobox help connections --json");
+        assert!(!guidance.to_string().contains("password"));
+    }
+
+    #[test]
+    fn interrupted_compose_stop_failure_reports_residual_services() {
+        let cancellation = OperationCancellation::default();
+        cancellation.cancel();
+        let error = finish_compose_shutdown(
+            Ok(()),
+            Err(RepoboxError::new(
+                ErrorKind::Runtime,
+                "compose_stop_failed",
+                "Docker daemon stopped responding",
+            )
+            .with_request_id("stop-request")),
+            &cancellation,
+            "feature-branch",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted_cleanup_incomplete");
+        assert!(error.message.contains("feature-branch"));
+        assert!(
+            error
+                .message
+                .contains("Compose services may remain running")
+        );
+        assert!(error.message.contains("compose_stop_failed"));
+        assert!(error.message.contains("Docker daemon stopped responding"));
+        assert_eq!(error.request_id.as_deref(), Some("stop-request"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn interactive_native_child_inherits_callers_process_group() {
+        let control = native_child_control(true, false);
+        let mut command = TokioCommand::new("sleep");
+        command
+            .arg("30")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        configure_native_process_group(&mut command, control);
+        let mut child = command.spawn().unwrap();
+        let child_pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
+
+        assert_eq!(
+            nix::unistd::getpgid(Some(child_pid)).unwrap(),
+            nix::unistd::getpgrp(),
+            "interactive native child must share the caller's foreground-capable process group"
+        );
+
+        child.kill().await.unwrap();
+        child.wait().await.unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn foreground_native_sigint_exit_is_a_clean_interruption() {
+        let control = RuntimeChildControl::NativeForeground;
+        let mut command = TokioCommand::new("sh");
+        command
+            .args(["-c", "kill -INT $$"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        configure_native_process_group(&mut command, control);
+        let child = command.spawn().unwrap();
+        let cancellation = OperationCancellation::default();
+
+        let (status, interrupted) = tokio::time::timeout(Duration::from_secs(2), async move {
+            wait_native_runtime_child(child, &cancellation, control).await
+        })
+        .await
+        .expect("SIGINT-exited child should be reaped promptly")
+        .unwrap();
+
+        assert!(!status.success());
+        assert!(interrupted);
+    }
+
+    #[cfg(target_os = "linux")]
+    async fn assert_native_interrupt_cleans_detached_descendant(control: RuntimeChildControl) {
+        let temp = tempfile::tempdir().unwrap();
+        let pid_path = temp.path().join("detached.pid");
+        let mut command = TokioCommand::new("sh");
+        command
+            .args([
+                "-c",
+                "detached=; \
+                 cleanup() { kill \"$detached\" 2>/dev/null || true; \
+                 wait \"$detached\" 2>/dev/null || true; exit 0; }; \
+                 trap cleanup INT TERM; \
+                 setsid sleep 30 & detached=$!; \
+                 printf '%s' \"$detached\" > \"$1\"; \
+                 wait \"$detached\"",
+                "sh",
+            ])
+            .arg(&pid_path)
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true);
+        configure_native_process_group(&mut command, control);
+        let child = command.spawn().unwrap();
+        let cancellation = OperationCancellation::default();
+        let operation_cancellation = cancellation.clone();
+        let wait = tokio::spawn(async move {
+            wait_native_runtime_child(child, &operation_cancellation, control).await
+        });
+        for _ in 0..100 {
+            if pid_path.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let detached_pid = std::fs::read_to_string(&pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        cancellation.cancel();
+        let (_, interrupted) = tokio::time::timeout(Duration::from_secs(2), wait)
+            .await
+            .expect("native cleanup should finish within its grace period")
+            .unwrap()
+            .unwrap();
+
+        assert!(interrupted);
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(detached_pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "native wrapper left its detached descendant running"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn isolated_native_interrupt_allows_parent_to_clean_detached_descendant() {
+        assert_native_interrupt_cleans_detached_descendant(RuntimeChildControl::NativeIsolated)
+            .await;
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn foreground_native_interrupt_allows_parent_to_clean_detached_descendant() {
+        assert_native_interrupt_cleans_detached_descendant(RuntimeChildControl::NativeForeground)
+            .await;
     }
 }

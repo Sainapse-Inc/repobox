@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet};
+use std::future::Future;
 use std::path::PathBuf;
 use std::process::Stdio;
 use std::time::Duration;
@@ -20,8 +21,9 @@ use repobox_core::state::{
 use repobox_core::{ErrorKind, RepoboxError, Result};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
+use tokio::process::{Child, Command};
+use tokio::sync::watch;
 use url::Url;
 
 use crate::credentials::CredentialStore;
@@ -32,6 +34,411 @@ use crate::output::Output;
 /// operation remains resumable without encouraging a duplicate create request.
 const PROVIDER_READINESS_TIMEOUT: Duration = Duration::from_mins(15);
 const PROVIDER_READINESS_POLL_INTERVAL: Duration = Duration::from_secs(2);
+const PROCESS_STDERR_TAIL_BYTES: usize = 64 * 1024;
+const FAILED_STREAM_EXIT_GRACE_PERIOD: Duration = Duration::from_secs(2);
+const DOCKER_CLEANUP_COMMAND_TIMEOUT: Duration = Duration::from_secs(1);
+const LOCAL_POSTGRES_READINESS_TIMEOUT: Duration = Duration::from_mins(1);
+const LOCAL_POSTGRES_READINESS_POLL_INTERVAL: Duration = Duration::from_millis(500);
+const CONTROLLED_COMMAND_SCRIPT: &str = r#"
+child=
+watcher=
+cleanup() {
+  [ -z "$watcher" ] || kill -KILL "$watcher" 2>/dev/null || true
+  [ -z "$child" ] || kill -KILL "$child" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+exec 3<&0
+"$@" </dev/null 3<&- &
+child=$!
+(
+  while IFS= read -r line; do :; done
+  kill -KILL "$child" 2>/dev/null || true
+) <&3 &
+watcher=$!
+exec 3<&-
+wait "$child"
+status=$?
+kill -KILL "$watcher" 2>/dev/null || true
+wait "$watcher" 2>/dev/null || true
+trap - EXIT HUP INT TERM
+exit "$status"
+"#;
+
+#[derive(Clone, Debug)]
+pub struct OperationCancellation {
+    sender: watch::Sender<bool>,
+}
+
+impl Default for OperationCancellation {
+    fn default() -> Self {
+        let (sender, _) = watch::channel(false);
+        Self { sender }
+    }
+}
+
+impl OperationCancellation {
+    pub fn cancel(&self) {
+        self.sender.send_replace(true);
+    }
+
+    pub fn is_cancelled(&self) -> bool {
+        *self.sender.borrow()
+    }
+
+    pub async fn cancelled(&self) {
+        let mut receiver = self.sender.subscribe();
+        if *receiver.borrow() {
+            return;
+        }
+        while receiver.changed().await.is_ok() {
+            if *receiver.borrow_and_update() {
+                return;
+            }
+        }
+    }
+
+    pub(crate) fn check(&self) -> Result<()> {
+        if self.is_cancelled() {
+            Err(operation_interrupted())
+        } else {
+            Ok(())
+        }
+    }
+}
+
+fn operation_interrupted() -> RepoboxError {
+    RepoboxError::new(
+        ErrorKind::Runtime,
+        "operation_interrupted",
+        "the operation was interrupted after its latest durable checkpoint; cleanup completed",
+    )
+    .with_suggestion("Run `repobox job view latest --json`, then resume the exact job UUID.")
+}
+
+fn interruption_error(error: &RepoboxError) -> bool {
+    matches!(
+        error.code.as_str(),
+        "operation_interrupted" | "operation_interrupted_cleanup_incomplete"
+    )
+}
+
+fn finish_with_cleanup<T>(
+    operation: Result<T>,
+    cleanup: Result<()>,
+    residual: impl AsRef<str>,
+) -> Result<T> {
+    match (operation, cleanup) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(cleanup_error)) => Err(RepoboxError::new(
+            ErrorKind::Runtime,
+            "operation_cleanup_failed",
+            format!(
+                "operation completed but cleanup failed; {} may remain: {}",
+                residual.as_ref(),
+                cleanup_error.message
+            ),
+        )
+        .with_suggestion(
+            "Inspect the named residual resource, remove it safely, then view the durable job.",
+        )),
+        (Err(error), Err(cleanup_error)) => {
+            let code = if interruption_error(&error) {
+                "operation_interrupted_cleanup_incomplete"
+            } else {
+                "operation_cleanup_failed"
+            };
+            Err(RepoboxError::new(
+                ErrorKind::Runtime,
+                code,
+                format!(
+                    "{}; cleanup failed and {} may remain: {}",
+                    error.message,
+                    residual.as_ref(),
+                    cleanup_error.message
+                ),
+            )
+            .with_suggestion(
+                "Inspect the named residual resource, remove it safely, then resume the exact durable job.",
+            ))
+        }
+    }
+}
+
+async fn finish_failed_compose_start<Cleanup>(
+    start_error: RepoboxError,
+    service: &str,
+    cleanup: Cleanup,
+) -> Result<()>
+where
+    Cleanup: Future<Output = Result<()>>,
+{
+    finish_with_cleanup(
+        Err(start_error),
+        cleanup.await,
+        format!("Compose source service `{service}`"),
+    )
+}
+
+#[derive(Debug)]
+struct DockerContainerCleanup {
+    name: String,
+    armed: bool,
+}
+
+impl DockerContainerCleanup {
+    fn new(name: String) -> Self {
+        Self { name, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+
+    fn run(&mut self) -> std::io::Result<()> {
+        if !self.armed {
+            return Ok(());
+        }
+        self.armed = false;
+        for attempt in 0..5 {
+            let name = self.name.clone();
+            let (sender, receiver) = std::sync::mpsc::sync_channel(1);
+            std::thread::spawn(move || {
+                let remove = std::process::Command::new("docker")
+                    .args(["rm", "--force", "--volumes", &name])
+                    .stdin(Stdio::null())
+                    .output();
+                let outcome = match remove {
+                    Ok(output) if output.status.success() => DockerCleanupAttempt::Succeeded,
+                    Ok(_) => {
+                        let inspection = std::process::Command::new("docker")
+                            .args(["container", "inspect", &name])
+                            .stdin(Stdio::null())
+                            .stdout(Stdio::null())
+                            .output();
+                        match inspection {
+                            Ok(output) => classify_docker_cleanup_commands(
+                                Some(false),
+                                Some(output.status.success()),
+                                &String::from_utf8_lossy(&output.stderr),
+                            ),
+                            Err(_) => classify_docker_cleanup_commands(Some(false), None, ""),
+                        }
+                    }
+                    Err(_) => classify_docker_cleanup_commands(None, None, ""),
+                };
+                let _ = sender.send(outcome);
+            });
+            let outcome = match receiver.recv_timeout(DOCKER_CLEANUP_COMMAND_TIMEOUT) {
+                Ok(outcome) => outcome,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => DockerCleanupAttempt::TimedOut,
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                    DockerCleanupAttempt::Disconnected
+                }
+            };
+            if let Some(result) = docker_cleanup_attempt_result(&self.name, outcome, attempt == 4) {
+                return result;
+            }
+            if attempt < 4 {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+        }
+        unreachable!("the final Docker cleanup attempt always returns a result")
+    }
+}
+
+impl Drop for DockerContainerCleanup {
+    fn drop(&mut self) {
+        let _ = self.run();
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+enum DockerCleanupAttempt {
+    Succeeded,
+    Failed,
+    TimedOut,
+    Disconnected,
+}
+
+fn classify_docker_cleanup_commands(
+    remove_succeeded: Option<bool>,
+    inspect_succeeded: Option<bool>,
+    inspect_stderr: &str,
+) -> DockerCleanupAttempt {
+    match (remove_succeeded, inspect_succeeded) {
+        (Some(true), _) => DockerCleanupAttempt::Succeeded,
+        (Some(false), Some(false))
+            if {
+                let stderr = inspect_stderr.to_ascii_lowercase();
+                stderr.contains("no such object") || stderr.contains("no such container")
+            } =>
+        {
+            DockerCleanupAttempt::Succeeded
+        }
+        (Some(false), Some(true)) => DockerCleanupAttempt::Failed,
+        (Some(false), Some(false) | None) | (None, _) => DockerCleanupAttempt::Disconnected,
+    }
+}
+
+fn docker_cleanup_attempt_result(
+    name: &str,
+    outcome: DockerCleanupAttempt,
+    final_attempt: bool,
+) -> Option<std::io::Result<()>> {
+    match outcome {
+        DockerCleanupAttempt::Succeeded => Some(Ok(())),
+        DockerCleanupAttempt::TimedOut => Some(Err(std::io::Error::new(
+            std::io::ErrorKind::TimedOut,
+            format!(
+                "timed out removing managed Docker container `{name}`; the cleanup command may still be running"
+            ),
+        ))),
+        DockerCleanupAttempt::Failed | DockerCleanupAttempt::Disconnected if final_attempt => {
+            Some(Err(std::io::Error::other(format!(
+                "could not remove managed Docker container `{name}` after 5 attempts"
+            ))))
+        }
+        DockerCleanupAttempt::Failed | DockerCleanupAttempt::Disconnected => None,
+    }
+}
+
+struct ManagedChild {
+    child: Child,
+    cleanup: Option<DockerContainerCleanup>,
+    #[cfg(unix)]
+    process_group: Option<nix::unistd::Pid>,
+    active: bool,
+}
+
+impl ManagedChild {
+    fn spawn(
+        mut command: Command,
+        cleanup: Option<DockerContainerCleanup>,
+    ) -> std::io::Result<Self> {
+        command.kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let child = command.spawn()?;
+        #[cfg(unix)]
+        let process_group = child
+            .id()
+            .and_then(|id| i32::try_from(id).ok())
+            .map(nix::unistd::Pid::from_raw);
+        Ok(Self {
+            child,
+            cleanup,
+            #[cfg(unix)]
+            process_group,
+            active: true,
+        })
+    }
+
+    fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        let status = self.child.try_wait()?;
+        if let Some(status) = status {
+            self.finish(status);
+        }
+        Ok(status)
+    }
+
+    async fn wait(&mut self) -> std::io::Result<std::process::ExitStatus> {
+        let status = self.child.wait().await?;
+        self.finish(status);
+        Ok(status)
+    }
+
+    fn start_kill(&mut self) -> std::io::Result<()> {
+        let process_group_result = self.kill_process_group();
+        let child_result = match self.child.start_kill() {
+            Err(error) if error.kind() == std::io::ErrorKind::InvalidInput => Ok(()),
+            result => result,
+        };
+        let cleanup_result = self
+            .cleanup
+            .as_mut()
+            .map_or(Ok(()), DockerContainerCleanup::run);
+        cleanup_result.and(process_group_result).and(child_result)
+    }
+
+    fn finish(&mut self, _status: std::process::ExitStatus) {
+        self.active = false;
+        if let Some(cleanup) = &mut self.cleanup {
+            // A normally reaped `docker run --rm` process has already completed
+            // Docker's own container removal, regardless of the inner psql exit status.
+            cleanup.disarm();
+        }
+        #[cfg(unix)]
+        {
+            self.process_group = None;
+        }
+    }
+
+    #[cfg(unix)]
+    fn kill_process_group(&self) -> std::io::Result<()> {
+        let Some(process_group) = self.process_group else {
+            return Ok(());
+        };
+        match nix::sys::signal::killpg(process_group, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => Ok(()),
+            Err(error) => Err(std::io::Error::from_raw_os_error(error as i32)),
+        }
+    }
+
+    #[cfg(not(unix))]
+    fn kill_process_group(&self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for ManagedChild {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let _ = self.kill_process_group();
+        let _ = self.child.start_kill();
+        if let Some(cleanup) = &mut self.cleanup {
+            let _ = cleanup.run();
+        }
+    }
+}
+
+struct PsqlCommand {
+    command: Command,
+    cleanup: Option<DockerContainerCleanup>,
+}
+
+impl PsqlCommand {
+    fn command_mut(&mut self) -> &mut Command {
+        &mut self.command
+    }
+
+    fn spawn(mut self) -> std::io::Result<ManagedChild> {
+        ManagedChild::spawn(self.command, self.cleanup.take())
+    }
+
+    async fn output(mut self) -> std::io::Result<std::process::Output> {
+        self.command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = self.spawn()?;
+        let mut stdout = child.child.stdout.take().expect("psql stdout is piped");
+        let mut stderr = child.child.stderr.take().expect("psql stderr is piped");
+        let mut stdout_bytes = Vec::new();
+        let mut stderr_bytes = Vec::new();
+        let (status, stdout_result, stderr_result) = tokio::join!(
+            child.wait(),
+            stdout.read_to_end(&mut stdout_bytes),
+            stderr.read_to_end(&mut stderr_bytes),
+        );
+        stdout_result?;
+        stderr_result?;
+        Ok(std::process::Output {
+            status: status?,
+            stdout: stdout_bytes,
+            stderr: stderr_bytes,
+        })
+    }
+}
 
 #[derive(Clone, Copy, Debug)]
 struct ProviderReadinessPolicy {
@@ -144,7 +551,9 @@ fn extension_priority(extension: &str) -> u8 {
 }
 
 async fn run_psql(url: &Url, sql: &str) -> Result<String> {
-    let output = psql_command(url)?
+    let mut command = psql_command(url)?;
+    command
+        .command_mut()
         .args([
             "--no-psqlrc",
             "--set",
@@ -154,9 +563,8 @@ async fn run_psql(url: &Url, sql: &str) -> Result<String> {
             "--command",
             sql,
         ])
-        .stdin(Stdio::null())
-        .output()
-        .await?;
+        .stdin(Stdio::null());
+    let output = command.output().await?;
     if output.status.success() {
         return Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned());
     }
@@ -171,7 +579,7 @@ async fn run_psql(url: &Url, sql: &str) -> Result<String> {
     ))
 }
 
-fn psql_command(url: &Url) -> Result<Command> {
+fn psql_command(url: &Url) -> Result<PsqlCommand> {
     let host = url.host_str().ok_or_else(|| {
         RepoboxError::new(
             ErrorKind::Runtime,
@@ -210,25 +618,64 @@ fn psql_command(url: &Url) -> Result<Command> {
             _ => {}
         }
     }
+    let requires_system_root_cert = url
+        .query_pairs()
+        .any(|(key, value)| key == "sslrootcert" && value == "system");
     let local_psql = std::process::Command::new("psql")
         .arg("--version")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .is_ok_and(|status| status.success());
-    let mut command = if local_psql {
-        Command::new("psql")
+        .stdin(Stdio::null())
+        .output()
+        .ok()
+        .filter(|output| output.status.success())
+        .and_then(|output| {
+            parse_psql_major_version(&output.stdout)
+                .or_else(|| parse_psql_major_version(&output.stderr))
+        })
+        .is_some_and(|major| psql_major_version_is_compatible(major, requires_system_root_cert));
+    let (mut command, cleanup) = if local_psql {
+        (Command::new("psql"), None)
     } else {
+        let id = uuid::Uuid::now_v7().simple().to_string();
+        let container_name = format!("repobox-psql-{}", &id[id.len() - 12..]);
         let mut command = Command::new("docker");
-        command.args(["run", "--rm", "-i"]);
+        command.args([
+            "run",
+            "--rm",
+            "--name",
+            &container_name,
+            "--label",
+            "io.repobox.managed=psql",
+            "-i",
+        ]);
         for key in environment.keys() {
             command.arg("-e").arg(key);
         }
         command.args(["postgres:18", "psql"]);
-        command
+        (command, Some(DockerContainerCleanup::new(container_name)))
     };
     command.envs(environment);
-    Ok(command)
+    Ok(PsqlCommand { command, cleanup })
+}
+
+fn parse_psql_major_version(output: &[u8]) -> Option<u32> {
+    std::str::from_utf8(output)
+        .ok()?
+        .split_whitespace()
+        .find_map(|component| {
+            let digits = component
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>();
+            if digits.is_empty() {
+                None
+            } else {
+                digits.parse().ok()
+            }
+        })
+}
+
+const fn psql_major_version_is_compatible(major: u32, requires_system_root_cert: bool) -> bool {
+    !requires_system_root_cert || major >= 16
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -237,6 +684,15 @@ pub struct EnvironmentMutation {
     pub job: JobRecord,
     pub resumed: bool,
 }
+
+#[derive(Clone, Debug, Eq, Ord, PartialEq, PartialOrd)]
+struct BranchDeletionTarget {
+    organization: String,
+    database: String,
+    branch: String,
+}
+
+type EnvironmentDeletionTargets = BTreeMap<String, BTreeMap<BranchDeletionTarget, bool>>;
 
 pub struct EnvironmentManager<'a> {
     config: &'a RepoboxConfig,
@@ -247,6 +703,7 @@ pub struct EnvironmentManager<'a> {
     jobs: JobStore,
     output: &'a Output,
     readiness: ProviderReadinessPolicy,
+    cancellation: OperationCancellation,
 }
 
 impl<'a> EnvironmentManager<'a> {
@@ -268,7 +725,13 @@ impl<'a> EnvironmentManager<'a> {
             jobs,
             output,
             readiness: ProviderReadinessPolicy::default(),
+            cancellation: OperationCancellation::default(),
         }
+    }
+
+    pub fn with_cancellation(mut self, cancellation: OperationCancellation) -> Self {
+        self.cancellation = cancellation;
+        self
     }
 
     #[cfg(test)]
@@ -321,6 +784,47 @@ impl<'a> EnvironmentManager<'a> {
         })
     }
 
+    pub fn delete_plan(&self, environment: &str) -> Result<DryRunPlan> {
+        let state = self.state_store.load(self.config.project.id)?;
+        let record = state.environments.get(environment).ok_or_else(|| {
+            RepoboxError::new(
+                ErrorKind::NotFound,
+                "environment_not_found",
+                format!("environment `{environment}` is not known locally"),
+            )
+        })?;
+        let mutation_lineages =
+            nonterminal_environment_mutation_jobs(&self.jobs, self.config.project.id, environment)?;
+        let checkpoint_jobs = unreconciled_environment_checkpoint_jobs(
+            &self.jobs,
+            self.config.project.id,
+            environment,
+        )?;
+        let cleanup_jobs = mutation_jobs_to_reconcile(&mutation_lineages, &checkpoint_jobs);
+        let targets = environment_deletion_targets(record, &cleanup_jobs)?;
+        let provider_calls = targets
+            .into_iter()
+            .flat_map(|(service, targets)| {
+                targets.into_keys().map(move |target| PlannedCall {
+                    provider: "planetscale".to_owned(),
+                    action: "delete_branch".to_owned(),
+                    resource: format!(
+                        "{}/{}/{} ({service})",
+                        target.organization, target.database, target.branch
+                    ),
+                })
+            })
+            .collect();
+        Ok(DryRunPlan {
+            operation: "environment_delete".to_owned(),
+            environment: environment.to_owned(),
+            provider_calls,
+            warnings: vec!["Provider branch deletion is irreversible.".to_owned()],
+            estimated_cost: None,
+            rollback_available: false,
+        })
+    }
+
     pub async fn ensure(
         &mut self,
         environment: &str,
@@ -368,6 +872,10 @@ impl<'a> EnvironmentManager<'a> {
                 selected.keys(),
             )?
         };
+        if let Some(record) = state.environments.get(environment) {
+            validate_selected_binding_identity(record, &selected, &provider_branch, false)?;
+        }
+        prepare_create_job_resources(&mut job, &selected, &provider_branch, resumed)?;
         job.status = JobStatus::Running;
         self.jobs.append(&job)?;
 
@@ -381,6 +889,7 @@ impl<'a> EnvironmentManager<'a> {
         self.state_store.save(&state)?;
 
         let mut failures = vec![];
+        let mut interruption = None;
         for (name, service) in selected {
             let step = format!("provision:{name}");
             job.update_step(&step, StepStatus::Running, None)?;
@@ -389,12 +898,11 @@ impl<'a> EnvironmentManager<'a> {
                 "step_started",
                 &serde_json::json!({"job_id": job.id, "step": step}),
             )?;
-            let result = if service.bootstrap.mode == BootstrapMode::Import
-                && !state.bootstrapped_services.contains(&name)
-            {
+            let bootstrap_marker = bootstrap_service_marker(&name, &service);
+            let result = if service.bootstrap.mode == BootstrapMode::Import {
                 match self.import_local_service(&name, &service).await {
                     Ok(()) => {
-                        state.bootstrapped_services.insert(name.clone());
+                        state.bootstrapped_services.insert(bootstrap_marker);
                         self.state_store.save(&state)?;
                         self.provision_service(&provider_branch, &name, &service, options)
                             .await
@@ -419,22 +927,14 @@ impl<'a> EnvironmentManager<'a> {
                         StepStatus::Succeeded,
                         Some(format!("{}/{}", binding.database, binding.branch)),
                     )?;
-                    if let Some(job_step) = job
-                        .steps
-                        .iter_mut()
-                        .find(|candidate| candidate.name == step)
-                    {
-                        job_step.resource = serde_json::to_value(&binding).map_err(|error| {
-                            RepoboxError::new(
-                                ErrorKind::Runtime,
-                                "job_encode_failed",
-                                error.to_string(),
-                            )
-                        })?;
-                    }
+                    update_create_step_binding(&mut job, &step, &binding)?;
                     self.event("step_succeeded", &binding)?;
                 }
                 Err(error) => {
+                    let interrupted = interruption_error(&error);
+                    if interrupted {
+                        interruption = Some(error.clone());
+                    }
                     failures.push(format!("{name}: {}", error.message));
                     job.error_code = Some(error.code.clone());
                     job.update_step(&step, StepStatus::Failed, Some(error.message.clone()))?;
@@ -445,6 +945,42 @@ impl<'a> EnvironmentManager<'a> {
                 }
             }
             self.jobs.append(&job)?;
+            if interruption.is_some() {
+                break;
+            }
+        }
+
+        if failures.is_empty() && interruption.is_none() {
+            let incomplete_steps = job
+                .steps
+                .iter()
+                .filter(|step| step.status != StepStatus::Succeeded)
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            let incomplete_services = incomplete_environment_services(
+                state
+                    .environments
+                    .get(environment)
+                    .expect("environment existence was checked"),
+                self.config,
+                &provider_branch,
+            );
+            if !incomplete_steps.is_empty() || !incomplete_services.is_empty() {
+                failures.push(format!(
+                    "durable provision is incomplete; unfinished steps: {}; incomplete bindings: {}",
+                    if incomplete_steps.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        incomplete_steps.join(", ")
+                    },
+                    if incomplete_services.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        incomplete_services.join(", ")
+                    }
+                ));
+                job.error_code = Some("environment_provision_incomplete".to_owned());
+            }
         }
 
         let finished_record = {
@@ -456,6 +992,7 @@ impl<'a> EnvironmentManager<'a> {
             if failures.is_empty() {
                 record.status = EnvironmentStatus::Ready;
                 job.status = JobStatus::Succeeded;
+                job.error_code = None;
             } else {
                 record.status = EnvironmentStatus::Degraded;
                 record.failures.clone_from(&failures);
@@ -470,7 +1007,9 @@ impl<'a> EnvironmentManager<'a> {
             job: job.clone(),
             resumed,
         };
-        if failures.is_empty() {
+        if let Some(error) = interruption {
+            Err(error)
+        } else if failures.is_empty() {
             Ok(mutation)
         } else {
             Err(RepoboxError::new(
@@ -493,6 +1032,7 @@ impl<'a> EnvironmentManager<'a> {
         environment: &str,
         keep_state: bool,
     ) -> Result<EnvironmentMutation> {
+        self.cancellation.check()?;
         let mut state = self.state_store.load(self.config.project.id)?;
         let record = state
             .environments
@@ -505,56 +1045,89 @@ impl<'a> EnvironmentManager<'a> {
                     format!("environment `{environment}` is not known locally"),
                 )
             })?;
+        let mutation_lineages =
+            nonterminal_environment_mutation_jobs(&self.jobs, self.config.project.id, environment)?;
+        let checkpoint_jobs = unreconciled_environment_checkpoint_jobs(
+            &self.jobs,
+            self.config.project.id,
+            environment,
+        )?;
+        let cleanup_jobs = mutation_jobs_to_reconcile(&mutation_lineages, &checkpoint_jobs);
+        let deletion_targets = environment_deletion_targets(&record, &cleanup_jobs)?;
         let mut job = JobRecord::new(
             JobKind::EnvironmentDelete,
             self.config.project.id,
             environment,
-            record
-                .databases
+            deletion_targets
                 .keys()
                 .map(|service| format!("delete:{service}")),
         );
         job.status = JobStatus::Running;
         self.jobs.append(&job)?;
         let mut failures = vec![];
-        for (service, binding) in &record.databases {
+        let mut interruption = None;
+        for (service, targets) in &deletion_targets {
+            if let Err(error) = self.cancellation.check() {
+                failures.push(error.message.clone());
+                job.error_code = Some(error.code.clone());
+                interruption = Some(error);
+                break;
+            }
             let step = format!("delete:{service}");
             job.update_step(&step, StepStatus::Running, None)?;
             self.jobs.append(&job)?;
-            let result = self
-                .provider
-                .delete_branch(&binding.organization, &binding.database, &binding.branch)
-                .await;
-            let provider_message = match result {
-                Ok(()) => None,
-                Err(error) if error.kind == ErrorKind::NotFound => {
-                    Some("provider branch was already absent".to_owned())
+            let mut service_failures = vec![];
+            let mut absent_branches = 0_usize;
+            for (target, checkpointed_credentials) in targets {
+                let result = self
+                    .provider
+                    .delete_branch(&target.organization, &target.database, &target.branch)
+                    .await;
+                match result {
+                    Ok(()) => {}
+                    Err(error) if error.kind == ErrorKind::NotFound => {
+                        absent_branches += 1;
+                    }
+                    Err(error) => {
+                        service_failures.push(format!("{}: {}", target.branch, error.message));
+                        continue;
+                    }
                 }
-                Err(error) => {
-                    failures.push(error.message.clone());
-                    job.update_step(&step, StepStatus::Failed, Some(error.message))?;
-                    self.jobs.append(&job)?;
-                    continue;
+                let key =
+                    CredentialStore::database_key(self.config.project.id, &target.branch, service);
+                let binding_has_credentials = record
+                    .databases
+                    .get(service)
+                    .is_some_and(|binding| binding.branch == target.branch);
+                let credential_result = if *checkpointed_credentials
+                    || binding_has_credentials
+                    || self.credentials.has_database_url_evidence(&key)?
+                {
+                    self.credentials.remove_database_urls(&key)
+                } else {
+                    Ok(())
+                };
+                if let Err(error) = credential_result {
+                    service_failures.push(format!("{}: {}", target.branch, error.message));
                 }
-            };
-            let key = CredentialStore::database_key(
-                self.config.project.id,
-                &record.provider_branch,
-                service,
-            );
-            match self.credentials.remove_database_urls(&key) {
-                Ok(()) => {
-                    job.update_step(&step, StepStatus::Succeeded, provider_message)?;
-                }
-                Err(error) => {
-                    failures.push(error.message.clone());
-                    job.update_step(&step, StepStatus::Failed, Some(error.message))?;
-                }
+            }
+            if service_failures.is_empty() {
+                let provider_message = match (targets.len(), absent_branches) {
+                    (_, 0) => None,
+                    (1, 1) => Some("provider branch was already absent".to_owned()),
+                    (_, count) => Some(format!("{count} provider branches were already absent")),
+                };
+                job.update_step(&step, StepStatus::Succeeded, provider_message)?;
+            } else {
+                failures.extend(service_failures.iter().cloned());
+                job.update_step(&step, StepStatus::Failed, Some(service_failures.join("; ")))?;
             }
             self.jobs.append(&job)?;
         }
-        if failures.is_empty() {
+        if failures.is_empty() && interruption.is_none() {
+            self.reconcile_environment_mutation_jobs(&cleanup_jobs)?;
             job.status = JobStatus::Succeeded;
+            job.error_code = None;
             if !keep_state {
                 state.environments.remove(environment);
                 self.state_store.save(&state)?;
@@ -563,6 +1136,9 @@ impl<'a> EnvironmentManager<'a> {
             job.status = JobStatus::Degraded;
         }
         self.jobs.append(&job)?;
+        if let Some(error) = interruption {
+            return Err(error);
+        }
         if !failures.is_empty() {
             return Err(RepoboxError::new(
                 ErrorKind::Runtime,
@@ -575,6 +1151,18 @@ impl<'a> EnvironmentManager<'a> {
             job,
             resumed: false,
         })
+    }
+
+    pub async fn delete_many(
+        &mut self,
+        environments: &[String],
+    ) -> Result<Vec<EnvironmentMutation>> {
+        let mut deleted = Vec::with_capacity(environments.len());
+        for environment in environments {
+            self.cancellation.check()?;
+            deleted.push(self.delete(environment, false).await?);
+        }
+        Ok(deleted)
     }
 
     pub fn pull_plan(&self, environment: &str, options: &ProvisionOptions) -> Result<DryRunPlan> {
@@ -649,14 +1237,18 @@ impl<'a> EnvironmentManager<'a> {
         let canonical = provider_branch_name(self.config.project.id, environment)?;
         let selected = self.selected_services(options)?;
         let mut state = self.state_store.load(self.config.project.id)?;
-        if !state.environments.contains_key(environment) {
-            return Err(RepoboxError::new(
-                ErrorKind::NotFound,
-                "environment_not_found",
-                format!("environment `{environment}` does not exist"),
-            )
-            .with_suggestion("Run `repobox env create --yes` first."));
-        }
+        let initial_status = state
+            .environments
+            .get(environment)
+            .map(|record| record.status)
+            .ok_or_else(|| {
+                RepoboxError::new(
+                    ErrorKind::NotFound,
+                    "environment_not_found",
+                    format!("environment `{environment}` does not exist"),
+                )
+                .with_suggestion("Run `repobox env create --yes` first.")
+            })?;
         let (mut job, resumed) = if let Some(job) = exact_job {
             (
                 self.prepare_resumable_job(
@@ -676,6 +1268,30 @@ impl<'a> EnvironmentManager<'a> {
                 selected.keys(),
             )?
         };
+        if !resumed && initial_status != EnvironmentStatus::Ready {
+            return Err(RepoboxError::new(
+                ErrorKind::Conflict,
+                "environment_not_ready_for_pull",
+                format!(
+                    "environment `{environment}` is {initial_status:?}; a new pull cannot replace data until its incomplete operation is resolved"
+                ),
+            )
+            .with_suggestion(
+                "Resume the exact degraded create or pull job, or delete the environment and recreate it before starting a new pull.",
+            ));
+        }
+        if !resumed {
+            validate_selected_binding_identity(
+                state
+                    .environments
+                    .get(environment)
+                    .expect("environment existence was checked"),
+                &selected,
+                &canonical,
+                true,
+            )?;
+        }
+        prepare_pull_job_resources(&mut job, &selected, &canonical, resumed)?;
         job.status = JobStatus::Running;
         self.jobs.append(&job)?;
         {
@@ -690,6 +1306,7 @@ impl<'a> EnvironmentManager<'a> {
         self.state_store.save(&state)?;
 
         let mut failures = vec![];
+        let mut interruption = None;
         for (name, service) in selected {
             let step = format!("refresh:{name}");
             if job
@@ -699,6 +1316,14 @@ impl<'a> EnvironmentManager<'a> {
                 .is_some_and(|step| step.status == StepStatus::Succeeded)
             {
                 continue;
+            }
+            if let Err(error) = self.cancellation.check()
+                && !pull_step_may_require_forward_repair(&job, &step)
+            {
+                failures.push(format!("{name}: {}", error.message));
+                job.error_code = Some(error.code.clone());
+                interruption = Some(error);
+                break;
             }
             job.update_step(&step, StepStatus::Running, None)?;
             self.jobs.append(&job)?;
@@ -723,14 +1348,19 @@ impl<'a> EnvironmentManager<'a> {
                         StepStatus::Succeeded,
                         Some("provider branch swapped forward".to_owned()),
                     )?;
-                    set_step_resource(
+                    update_pull_step_phase(
                         &mut job,
                         &step,
-                        serde_json::json!({"phase": "complete", "binding": binding}),
+                        "complete",
+                        serde_json::json!({"binding": binding}),
                     )?;
                     self.event("step_succeeded", &binding)?;
                 }
                 Err(error) => {
+                    let interrupted = interruption_error(&error);
+                    if interrupted {
+                        interruption = Some(error.clone());
+                    }
                     failures.push(format!("{name}: {}", error.message));
                     job.error_code = Some(error.code.clone());
                     job.update_step(&step, StepStatus::Failed, Some(error.message.clone()))?;
@@ -741,6 +1371,42 @@ impl<'a> EnvironmentManager<'a> {
                 }
             }
             self.jobs.append(&job)?;
+            if interruption.is_some() {
+                break;
+            }
+        }
+
+        if failures.is_empty() && interruption.is_none() {
+            let incomplete_steps = job
+                .steps
+                .iter()
+                .filter(|step| step.status != StepStatus::Succeeded)
+                .map(|step| step.name.clone())
+                .collect::<Vec<_>>();
+            let incomplete_services = incomplete_environment_services(
+                state
+                    .environments
+                    .get(environment)
+                    .expect("environment existence was checked"),
+                self.config,
+                &canonical,
+            );
+            if !incomplete_steps.is_empty() || !incomplete_services.is_empty() {
+                failures.push(format!(
+                    "durable pull is incomplete; unfinished steps: {}; incomplete bindings: {}",
+                    if incomplete_steps.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        incomplete_steps.join(", ")
+                    },
+                    if incomplete_services.is_empty() {
+                        "none".to_owned()
+                    } else {
+                        incomplete_services.join(", ")
+                    }
+                ));
+                job.error_code = Some("environment_pull_incomplete".to_owned());
+            }
         }
 
         let finished_record = {
@@ -749,9 +1415,10 @@ impl<'a> EnvironmentManager<'a> {
                 .get_mut(environment)
                 .expect("environment existence was checked");
             record.updated_at = Utc::now();
-            if failures.is_empty() {
+            if failures.is_empty() && interruption.is_none() {
                 record.status = EnvironmentStatus::Ready;
                 job.status = JobStatus::Succeeded;
+                job.error_code = None;
             } else {
                 record.status = EnvironmentStatus::Degraded;
                 record.failures.clone_from(&failures);
@@ -766,7 +1433,9 @@ impl<'a> EnvironmentManager<'a> {
             job: job.clone(),
             resumed,
         };
-        if failures.is_empty() {
+        if let Some(error) = interruption {
+            Err(error)
+        } else if failures.is_empty() {
             Ok(mutation)
         } else {
             Err(RepoboxError::new(
@@ -788,6 +1457,7 @@ impl<'a> EnvironmentManager<'a> {
         service: &ServiceConfig,
         options: &ProvisionOptions,
     ) -> Result<DatabaseBinding> {
+        self.cancellation.check()?;
         let RemoteServiceConfig::Planetscale {
             organization,
             database,
@@ -800,10 +1470,12 @@ impl<'a> EnvironmentManager<'a> {
             vec![cluster_size.clone()]
         };
         let size = select_smallest_size(&sizes)?;
+        self.cancellation.check()?;
 
         let database_exists = self
             .wait_for_existing_database(organization, database)
             .await?;
+        self.cancellation.check()?;
         if !database_exists {
             match service.bootstrap.mode {
                 BootstrapMode::Attach => {
@@ -819,6 +1491,7 @@ impl<'a> EnvironmentManager<'a> {
                     ));
                 }
                 BootstrapMode::Empty | BootstrapMode::Import => {
+                    self.cancellation.check()?;
                     self.output.progress(&format!(
                         "creating PlanetScale database {organization}/{database}"
                     ));
@@ -832,6 +1505,7 @@ impl<'a> EnvironmentManager<'a> {
                         })
                         .await?;
                     self.wait_for_database(organization, database).await?;
+                    self.cancellation.check()?;
                 }
             }
         }
@@ -839,6 +1513,7 @@ impl<'a> EnvironmentManager<'a> {
         let branch_exists = self
             .wait_for_existing_branch(organization, database, provider_branch)
             .await?;
+        self.cancellation.check()?;
         let key =
             CredentialStore::database_key(self.config.project.id, provider_branch, service_name);
         if branch_exists
@@ -864,6 +1539,7 @@ impl<'a> EnvironmentManager<'a> {
         }
 
         if !branch_exists {
+            self.cancellation.check()?;
             let backup = self
                 .latest_backup(
                     organization,
@@ -877,6 +1553,7 @@ impl<'a> EnvironmentManager<'a> {
                         || service.bootstrap.mode == BootstrapMode::Import,
                 )
                 .await?;
+            self.cancellation.check()?;
             self.output.progress(&format!(
                 "restoring {organization}/{database}/{provider_branch} from backup {}",
                 backup.name
@@ -893,8 +1570,10 @@ impl<'a> EnvironmentManager<'a> {
                 .await?;
             self.wait_for_branch(organization, database, provider_branch)
                 .await?;
+            self.cancellation.check()?;
         }
 
+        self.cancellation.check()?;
         let desired_role_name = role_name(provider_branch, service_name);
         let existing = self
             .provider
@@ -978,28 +1657,41 @@ impl<'a> EnvironmentManager<'a> {
             .and_then(serde_json::Value::as_str)
             .unwrap_or("planned")
             .to_owned();
-        let size = if cluster_size == "auto-smallest" {
-            select_smallest_size(&self.provider.list_cluster_sizes(organization).await?)?
-        } else {
-            cluster_size.clone()
-        };
-
-        if !self
-            .wait_for_existing_database(organization, database)
-            .await?
-        {
-            return Err(RepoboxError::new(
-                ErrorKind::NotFound,
-                "planetscale_database_not_found",
-                format!("PlanetScale database `{organization}/{database}` does not exist"),
-            ));
+        if !matches!(phase.as_str(), "credentialed" | "old_deleted") {
+            self.cancellation.check()?;
         }
 
-        if matches!(phase.as_str(), "planned" | "staged" | "credentialed") {
+        if !matches!(phase.as_str(), "credentialed" | "old_deleted") {
+            if !self
+                .wait_for_existing_database(organization, database)
+                .await?
+            {
+                return Err(RepoboxError::new(
+                    ErrorKind::NotFound,
+                    "planetscale_database_not_found",
+                    format!("PlanetScale database `{organization}/{database}` does not exist"),
+                ));
+            }
+            self.cancellation.check()?;
+        }
+
+        if matches!(phase.as_str(), "planned" | "staged") {
             if !self
                 .wait_for_existing_branch(organization, database, &staging)
                 .await?
             {
+                if phase != "planned" {
+                    return Err(RepoboxError::new(
+                        ErrorKind::Conflict,
+                        "pull_staging_branch_missing",
+                        format!(
+                            "pull step `{step}` is {phase}, but its recorded staging branch `{staging}` is missing"
+                        ),
+                    )
+                    .with_suggestion(
+                        "Do not recreate the staging branch implicitly. Inspect the durable job and provider branches, then restart the pull only after reconciling credentials.",
+                    ));
+                }
                 let backup = self
                     .latest_backup(
                         organization,
@@ -1009,6 +1701,13 @@ impl<'a> EnvironmentManager<'a> {
                         options.wait_for_backup,
                     )
                     .await?;
+                self.cancellation.check()?;
+                let size = if cluster_size == "auto-smallest" {
+                    select_smallest_size(&self.provider.list_cluster_sizes(organization).await?)?
+                } else {
+                    cluster_size.clone()
+                };
+                self.cancellation.check()?;
                 self.provider
                     .create_branch(&CreateBranchRequest {
                         organization: organization.clone(),
@@ -1021,16 +1720,14 @@ impl<'a> EnvironmentManager<'a> {
                     .await?;
                 self.wait_for_branch(organization, database, &staging)
                     .await?;
+                self.cancellation.check()?;
             }
             if phase == "planned" {
                 "staged".clone_into(&mut phase);
-                set_step_resource(
-                    job,
-                    step,
-                    serde_json::json!({"phase": phase, "staging": staging}),
-                )?;
+                update_pull_step_phase(job, step, &phase, serde_json::Value::Null)?;
                 self.jobs.append(job)?;
             }
+            self.cancellation.check()?;
         }
 
         let staging_key =
@@ -1039,6 +1736,7 @@ impl<'a> EnvironmentManager<'a> {
             CredentialStore::database_key(self.config.project.id, canonical, service_name);
         let desired_role_name = role_name(canonical, service_name);
         if phase == "staged" {
+            self.cancellation.check()?;
             let role = self
                 .ensure_pull_role(
                     organization,
@@ -1049,6 +1747,7 @@ impl<'a> EnvironmentManager<'a> {
                     &staging_key,
                 )
                 .await?;
+            self.cancellation.check()?;
             let (_, staging_direct) = self.credentials.database_urls(&staging_key)?;
             let staging_direct = Url::parse(&staging_direct).map_err(|error| {
                 RepoboxError::new(
@@ -1066,32 +1765,38 @@ impl<'a> EnvironmentManager<'a> {
             )
             .await?;
             "credentialed".clone_into(&mut phase);
-            set_step_resource(
+            update_pull_step_phase(
                 job,
                 step,
-                serde_json::json!({
-                    "phase": phase,
-                    "staging": staging,
-                    "role_id": role.id,
-                    "role_name": role.name,
-                }),
+                &phase,
+                serde_json::json!({"role_id": role.id, "role_name": role.name}),
             )?;
             self.jobs.append(job)?;
+            self.cancellation.check()?;
         }
 
         if phase == "credentialed" {
             let branches = self.provider.list_branches(organization, database).await?;
+            if !branches.iter().any(|branch| branch.name == staging) {
+                return Err(RepoboxError::new(
+                    ErrorKind::Conflict,
+                    "pull_staging_branch_missing",
+                    format!(
+                        "credentialed pull step `{step}` has no recorded staging branch `{staging}`"
+                    ),
+                )
+                .with_suggestion(
+                    "Do not delete the canonical branch. Inspect the durable job, provider branches, and staging credentials before restarting the pull.",
+                ));
+            }
             if branches.iter().any(|branch| branch.name == canonical) {
+                self.cancellation.check()?;
                 self.provider
                     .delete_branch(organization, database, canonical)
                     .await?;
             }
             "old_deleted".clone_into(&mut phase);
-            set_step_resource(
-                job,
-                step,
-                serde_json::json!({"phase": phase, "staging": staging}),
-            )?;
+            update_pull_step_phase(job, step, &phase, serde_json::Value::Null)?;
             self.jobs.append(job)?;
         }
 
@@ -1101,8 +1806,6 @@ impl<'a> EnvironmentManager<'a> {
                 self.provider
                     .rename_branch(organization, database, &staging, canonical)
                     .await?;
-                self.wait_for_branch(organization, database, canonical)
-                    .await?;
             } else if !branches.iter().any(|branch| branch.name == canonical) {
                 return Err(RepoboxError::new(
                     ErrorKind::Conflict,
@@ -1110,15 +1813,21 @@ impl<'a> EnvironmentManager<'a> {
                     "neither the staging nor canonical branch exists during a forward-only swap",
                 ));
             }
-            "swapped".clone_into(&mut phase);
-            set_step_resource(
-                job,
-                step,
-                serde_json::json!({"phase": phase, "staging": staging}),
-            )?;
+            "renamed".clone_into(&mut phase);
+            update_pull_step_phase(job, step, &phase, serde_json::Value::Null)?;
             self.jobs.append(job)?;
         }
 
+        if phase == "renamed" {
+            self.cancellation.check()?;
+            self.wait_for_branch(organization, database, canonical)
+                .await?;
+            "swapped".clone_into(&mut phase);
+            update_pull_step_phase(job, step, &phase, serde_json::Value::Null)?;
+            self.jobs.append(job)?;
+        }
+
+        self.cancellation.check()?;
         let (pooled, direct) =
             database_urls_or_fallback(self.credentials.database_urls(&staging_key), || {
                 self.credentials.database_urls(&canonical_key)
@@ -1277,6 +1986,7 @@ impl<'a> EnvironmentManager<'a> {
         service_name: &str,
         service: &ServiceConfig,
     ) -> Result<()> {
+        self.cancellation.check()?;
         if !self.config.data.allow_copy {
             return Err(RepoboxError::new(
                 ErrorKind::Conflict,
@@ -1302,6 +2012,7 @@ impl<'a> EnvironmentManager<'a> {
         } else {
             cluster_size.clone()
         };
+        self.cancellation.check()?;
         if !self
             .wait_for_existing_database(organization, database)
             .await?
@@ -1317,6 +2028,7 @@ impl<'a> EnvironmentManager<'a> {
                 .await?;
             self.wait_for_database(organization, database).await?;
         }
+        self.cancellation.check()?;
 
         let project_digest =
             Sha256::digest(format!("{}\0{service_name}", self.config.project.id).as_bytes());
@@ -1332,6 +2044,7 @@ impl<'a> EnvironmentManager<'a> {
             self.output.progress(&format!(
                 "reusing completed import backup for {organization}/{database}"
             ));
+            self.cancellation.check()?;
             return Ok(());
         }
         if let Some(pending) = backups.iter().find(|backup| {
@@ -1349,9 +2062,11 @@ impl<'a> EnvironmentManager<'a> {
             self.output.progress(&format!(
                 "reusing completed import backup for {organization}/{database}"
             ));
+            self.cancellation.check()?;
             return Ok(());
         }
 
+        self.cancellation.check()?;
         let role_name = backup_prefix.clone();
         if let Some(role) = self
             .provider
@@ -1370,6 +2085,7 @@ impl<'a> EnvironmentManager<'a> {
                 )
                 .await?;
         }
+        self.cancellation.check()?;
         let role = self
             .provider
             .create_role(&CreateRoleRequest {
@@ -1380,21 +2096,23 @@ impl<'a> EnvironmentManager<'a> {
                 inherited_roles: vec!["postgres".to_owned()],
             })
             .await?;
-        let direct = connection_urls(&role)?.direct;
-        let remote = RemoteDatabaseRef {
-            organization,
-            database,
-            branch: base_branch,
-        };
-        let import_result = self
-            .copy_compose_database(
+        let import_result = async {
+            let direct = connection_urls(&role)?.direct;
+            let remote = RemoteDatabaseRef {
+                organization,
+                database,
+                branch: base_branch,
+            };
+            self.copy_compose_database(
                 &service.local.compose_service,
                 &compose.files,
                 &compose.profiles,
                 &direct,
                 remote,
             )
-            .await;
+            .await
+        }
+        .await;
         let cleanup_result = self
             .provider
             .delete_role(
@@ -1405,7 +2123,15 @@ impl<'a> EnvironmentManager<'a> {
                 Some("postgres"),
             )
             .await;
-        import_result.and(cleanup_result)?;
+        finish_with_cleanup(
+            import_result,
+            cleanup_result,
+            format!(
+                "temporary PlanetScale role `{}` on {organization}/{database}/{base_branch}",
+                role.name
+            ),
+        )?;
+        self.cancellation.check()?;
         let backup_name = format!("{backup_prefix}-{}", Utc::now().format("%Y%m%d%H%M%S"));
         let backup = self
             .provider
@@ -1419,6 +2145,7 @@ impl<'a> EnvironmentManager<'a> {
             &backup_name,
         )
         .await?;
+        self.cancellation.check()?;
         self.output.progress(&format!(
             "imported local `{service_name}` into {organization}/{database} and captured backup `{backup_name}`"
         ));
@@ -1433,34 +2160,66 @@ impl<'a> EnvironmentManager<'a> {
         target: &Url,
         remote: RemoteDatabaseRef<'_>,
     ) -> Result<()> {
+        self.cancellation.check()?;
         let was_running = self
             .compose_service_running(files, profiles, compose_service)
             .await?;
         let mut compose = self.compose_command(files, profiles);
         if !was_running {
+            self.cancellation.check()?;
             let status = compose
                 .args(["up", "--detach", compose_service])
                 .status()
                 .await?;
             if !status.success() {
-                return Err(RepoboxError::new(
+                let start_error = RepoboxError::new(
                     ErrorKind::Runtime,
                     "local_postgres_start_failed",
                     format!("Docker Compose exited with {status}"),
-                ));
+                );
+                return finish_failed_compose_start(
+                    start_error,
+                    compose_service,
+                    self.stop_compose_service(files, profiles, compose_service),
+                )
+                .await;
             }
         }
 
-        let copy_result = self
-            .copy_running_compose_database(compose_service, files, profiles, target, remote)
-            .await;
+        let copy_result = async {
+            self.cancellation.check()?;
+            if !was_running {
+                wait_for_local_postgres_readiness(
+                    &self.cancellation,
+                    compose_service,
+                    LOCAL_POSTGRES_READINESS_TIMEOUT,
+                    LOCAL_POSTGRES_READINESS_POLL_INTERVAL,
+                    || {
+                        let mut command = self.compose_command(files, profiles);
+                        command.args(["exec", "-T", compose_service, "pg_isready", "--quiet"]);
+                        async move {
+                            let output = command.output().await?;
+                            Ok(output.status.success())
+                        }
+                    },
+                )
+                .await?;
+            }
+            self.copy_running_compose_database(compose_service, files, profiles, target, remote)
+                .await
+        }
+        .await;
         let cleanup_result = if was_running {
             Ok(())
         } else {
             self.stop_compose_service(files, profiles, compose_service)
                 .await
         };
-        copy_result.and(cleanup_result)
+        finish_with_cleanup(
+            copy_result,
+            cleanup_result,
+            format!("Compose source service `{compose_service}`"),
+        )
     }
 
     async fn copy_running_compose_database(
@@ -1514,60 +2273,37 @@ impl<'a> EnvironmentManager<'a> {
         .await?;
 
         let mut dump = self.compose_command(files, profiles);
-        let mut dump = dump
-            .args([
-                "exec",
-                "-T",
-                compose_service,
-                "pg_dump",
-                "--clean",
-                "--if-exists",
-                "--no-owner",
-                "--no-acl",
-                "--username",
-                &user,
-                "--dbname",
-                &local_database,
-            ])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let dump_stdout = dump.stdout.take().expect("pg_dump stdout is piped");
+        dump.args([
+            "exec",
+            "-T",
+            compose_service,
+            "sh",
+            "-c",
+            CONTROLLED_COMMAND_SCRIPT,
+            "repobox-pg-dump",
+            "pg_dump",
+            "--clean",
+            "--if-exists",
+            "--no-owner",
+            "--no-acl",
+            "--username",
+            &user,
+            "--dbname",
+            &local_database,
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+        let dump = ManagedChild::spawn(dump, None)?;
         let mut restore = psql_command(target)?;
-        let mut restore = restore
+        restore
+            .command_mut()
             .args(["--no-psqlrc", "--set", "ON_ERROR_STOP=1"])
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()?;
-        let mut restore_stdin = restore.stdin.take().expect("psql stdin is piped");
-        let mut dump_stdout = dump_stdout;
-        tokio::io::copy(&mut dump_stdout, &mut restore_stdin).await?;
-        restore_stdin.shutdown().await?;
-        drop(restore_stdin);
-        let dump_output = dump.wait_with_output().await?;
-        let restore_output = restore.wait_with_output().await?;
-        if !dump_output.status.success() {
-            return Err(RepoboxError::new(
-                ErrorKind::Runtime,
-                "local_postgres_dump_failed",
-                String::from_utf8_lossy(&dump_output.stderr)
-                    .trim()
-                    .to_owned(),
-            ));
-        }
-        if !restore_output.status.success() {
-            let mut redactor = repobox_core::redaction::SecretRedactor::default();
-            if let Some(password) = target.password() {
-                redactor.add(password);
-            }
-            return Err(RepoboxError::new(
-                ErrorKind::Runtime,
-                "planetscale_import_failed",
-                redactor.redact(String::from_utf8_lossy(&restore_output.stderr).trim()),
-            ));
-        }
-        Ok(())
+            .stderr(Stdio::piped());
+        let restore = restore.spawn()?;
+        stream_database_copy(dump, restore, target, &self.cancellation).await
     }
 
     async fn compose_service_running(
@@ -1708,7 +2444,14 @@ impl<'a> EnvironmentManager<'a> {
             .provider
             .delete_role(organization, database, base_branch, &source_role.id, None)
             .await;
-        replay.and(cleanup)
+        finish_with_cleanup(
+            replay,
+            cleanup,
+            format!(
+                "temporary PlanetScale inspection role `{}` on {organization}/{database}/{base_branch}",
+                source_role.name
+            ),
+        )
     }
 
     async fn wait_for_backup(
@@ -1738,7 +2481,7 @@ impl<'a> EnvironmentManager<'a> {
                     _ => {}
                 }
             }
-            if !self.wait_for_next_provider_poll(started).await {
+            if !self.wait_for_next_provider_poll(started).await? {
                 break;
             }
         }
@@ -1806,7 +2549,7 @@ impl<'a> EnvironmentManager<'a> {
                 Err(error) if error.kind == ErrorKind::NotFound => {}
                 Err(error) => return Err(error),
             }
-            if !self.wait_for_next_provider_poll(started).await {
+            if !self.wait_for_next_provider_poll(started).await? {
                 break;
             }
         }
@@ -1825,22 +2568,25 @@ impl<'a> EnvironmentManager<'a> {
             {
                 return Ok(());
             }
-            if !self.wait_for_next_provider_poll(started).await {
+            if !self.wait_for_next_provider_poll(started).await? {
                 break;
             }
         }
         Err(provider_timeout("database", database))
     }
 
-    async fn wait_for_next_provider_poll(&self, started: tokio::time::Instant) -> bool {
+    async fn wait_for_next_provider_poll(&self, started: tokio::time::Instant) -> Result<bool> {
         let Some(remaining) = self.readiness.timeout.checked_sub(started.elapsed()) else {
-            return false;
+            return Ok(false);
         };
         if remaining.is_zero() {
-            return false;
+            return Ok(false);
         }
-        tokio::time::sleep(self.readiness.poll_interval.min(remaining)).await;
-        true
+        tokio::select! {
+            biased;
+            () = self.cancellation.cancelled() => Err(operation_interrupted()),
+            () = tokio::time::sleep(self.readiness.poll_interval.min(remaining)) => Ok(true),
+        }
     }
 
     fn selected_services(
@@ -1862,6 +2608,54 @@ impl<'a> EnvironmentManager<'a> {
             selected.insert(name.clone(), service.clone());
         }
         Ok(selected)
+    }
+
+    fn mutation_lineages(&self, environment: &str) -> Result<Vec<JobRecord>> {
+        nonterminal_environment_mutation_jobs(&self.jobs, self.config.project.id, environment)
+    }
+
+    fn validate_unique_mutation_lineage(
+        &self,
+        selected: &JobRecord,
+        environment: &str,
+    ) -> Result<()> {
+        let terminal_residuals = unreconciled_environment_checkpoint_jobs(
+            &self.jobs,
+            self.config.project.id,
+            environment,
+        )?
+        .into_iter()
+        .filter(|job| job.id != selected.id && job.status.terminal())
+        .collect::<Vec<_>>();
+        match terminal_residuals.as_slice() {
+            [] => {}
+            [job] => {
+                return Err(environment_recovery_required(
+                    job,
+                    "resume another environment mutation",
+                ));
+            }
+            _ => return Err(mutation_lineage_conflict(environment, &terminal_residuals)),
+        }
+        let lineages = self.mutation_lineages(environment)?;
+        if lineages.iter().all(|job| job.id == selected.id) {
+            return Ok(());
+        }
+        Err(mutation_lineage_conflict(environment, &lineages))
+    }
+
+    fn reconcile_environment_mutation_jobs(&self, lineages: &[JobRecord]) -> Result<()> {
+        for lineage in lineages {
+            let mut reconciled = lineage.clone();
+            if !reconciled.status.terminal() {
+                reconciled.status = JobStatus::Canceled;
+            }
+            reconciled.error_code = Some("environment_deleted".to_owned());
+            reconciled.sequence += 1;
+            reconciled.updated_at = Utc::now();
+            self.jobs.append(&reconciled)?;
+        }
+        Ok(())
     }
 
     fn validate_resumable_job(
@@ -1916,6 +2710,7 @@ impl<'a> EnvironmentManager<'a> {
         services: impl Iterator<Item = &'b String>,
     ) -> Result<JobRecord> {
         self.validate_resumable_job(&job, kind, environment)?;
+        self.validate_unique_mutation_lineage(&job, environment)?;
         for service in services {
             let name = format!("{step_prefix}{service}");
             if !job.steps.iter().any(|step| step.name == name) {
@@ -1939,14 +2734,41 @@ impl<'a> EnvironmentManager<'a> {
         services: impl Iterator<Item = &'b String>,
     ) -> Result<(JobRecord, bool)> {
         let services = services.cloned().collect::<Vec<_>>();
-        if let Some(job) = self.jobs.list()?.into_iter().rev().find(|job| {
-            job.kind == kind
-                && job.environment == environment
-                && matches!(
-                    job.status,
-                    JobStatus::Pending | JobStatus::Running | JobStatus::Degraded
-                )
-        }) {
+        let unreconciled_checkpoints = unreconciled_environment_checkpoint_jobs(
+            &self.jobs,
+            self.config.project.id,
+            environment,
+        )?;
+        let terminal_checkpoints = unreconciled_checkpoints
+            .iter()
+            .filter(|job| job.status.terminal())
+            .collect::<Vec<_>>();
+        match terminal_checkpoints.as_slice() {
+            [] => {}
+            [job] => {
+                return Err(environment_recovery_required(
+                    job,
+                    "start an environment mutation",
+                ));
+            }
+            _ => {
+                return Err(mutation_lineage_conflict(
+                    environment,
+                    &unreconciled_checkpoints,
+                ));
+            }
+        }
+        let lineages = self.mutation_lineages(environment)?;
+        if lineages.len() > 1 {
+            return Err(mutation_lineage_conflict(environment, &lineages));
+        }
+        if let Some(job) = lineages.into_iter().next() {
+            if job.kind != kind || !job_scope_matches(&job, step_prefix, &services) {
+                return Err(environment_recovery_required(
+                    &job,
+                    "start a different environment mutation",
+                ));
+            }
             return Ok((
                 self.prepare_resumable_job(job, kind, environment, step_prefix, services.iter())?,
                 true,
@@ -1974,6 +2796,390 @@ impl<'a> EnvironmentManager<'a> {
     }
 }
 
+enum StreamDatabaseCopyExit {
+    Completed {
+        transfer_result: std::io::Result<()>,
+        dump_status: Option<std::process::ExitStatus>,
+        restore_status: std::process::ExitStatus,
+        restore_was_terminated: bool,
+    },
+    RestoreExitedEarly {
+        restore_status: std::process::ExitStatus,
+    },
+    Cancelled,
+}
+
+enum StreamDatabaseCopyRace {
+    Transfer(std::io::Result<()>),
+    Restore(std::io::Result<std::process::ExitStatus>),
+    Cancelled,
+}
+
+async fn wait_for_local_postgres_readiness<Probe, ProbeFuture>(
+    cancellation: &OperationCancellation,
+    service: &str,
+    timeout: Duration,
+    poll_interval: Duration,
+    mut probe: Probe,
+) -> Result<()>
+where
+    Probe: FnMut() -> ProbeFuture,
+    ProbeFuture: Future<Output = Result<bool>>,
+{
+    let started = tokio::time::Instant::now();
+    loop {
+        cancellation.check()?;
+        if probe().await? {
+            return Ok(());
+        }
+        let Some(remaining) = timeout.checked_sub(started.elapsed()) else {
+            break;
+        };
+        if remaining.is_zero() {
+            break;
+        }
+        tokio::select! {
+            biased;
+            () = cancellation.cancelled() => return Err(operation_interrupted()),
+            () = tokio::time::sleep(poll_interval.min(remaining)) => {}
+        }
+    }
+    Err(RepoboxError::new(
+        ErrorKind::Runtime,
+        "local_postgres_readiness_timeout",
+        format!(
+            "Compose service `{service}` did not accept PostgreSQL connections within {} seconds",
+            timeout.as_secs()
+        ),
+    )
+    .with_suggestion(
+        "Inspect the service with `docker compose logs`, verify its health configuration, then resume the exact Repobox job.",
+    ))
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FailedStreamFailureSource {
+    Transfer,
+    StalledRestore,
+}
+
+fn failed_stream_failure_source(
+    restore_was_terminated: bool,
+    transfer_error: Option<&std::io::Error>,
+) -> Option<FailedStreamFailureSource> {
+    if !restore_was_terminated {
+        return None;
+    }
+    if transfer_error.is_some_and(|error| error.kind() != std::io::ErrorKind::BrokenPipe) {
+        Some(FailedStreamFailureSource::Transfer)
+    } else {
+        Some(FailedStreamFailureSource::StalledRestore)
+    }
+}
+
+async fn stream_database_copy(
+    mut dump: ManagedChild,
+    mut restore: ManagedChild,
+    target: &Url,
+    cancellation: &OperationCancellation,
+) -> Result<()> {
+    let mut dump_stdout = dump.child.stdout.take().expect("pg_dump stdout is piped");
+    let dump_stderr = dump.child.stderr.take().expect("pg_dump stderr is piped");
+    let dump_control = dump.child.stdin.take();
+    let mut restore_stdin = restore.child.stdin.take().expect("psql stdin is piped");
+    let restore_stderr = restore.child.stderr.take().expect("psql stderr is piped");
+
+    let stream = Box::pin(async move {
+        let dump_control = dump_control;
+        let mut transfer = Box::pin(async move {
+            let copy_result = tokio::io::copy(&mut dump_stdout, &mut restore_stdin)
+                .await
+                .map(|_| ());
+            let shutdown_result = restore_stdin.shutdown().await;
+            copy_result.and(shutdown_result)
+        });
+        let race = tokio::select! {
+            biased;
+            () = cancellation.cancelled() => StreamDatabaseCopyRace::Cancelled,
+            transfer_result = &mut transfer => StreamDatabaseCopyRace::Transfer(transfer_result),
+            restore_status = restore.wait() => StreamDatabaseCopyRace::Restore(restore_status),
+        };
+        match race {
+            StreamDatabaseCopyRace::Transfer(transfer_result) => {
+                drop(transfer);
+                drop(dump_control);
+                if transfer_result.is_err() {
+                    let dump_status = dump.try_wait()?;
+                    if dump_status.is_none() {
+                        dump.start_kill()?;
+                        let _ = dump.wait().await?;
+                    }
+                    let (restore_status, restore_was_terminated) = if let Ok(status) =
+                        tokio::time::timeout(FAILED_STREAM_EXIT_GRACE_PERIOD, restore.wait()).await
+                    {
+                        (status?, false)
+                    } else {
+                        restore.start_kill()?;
+                        (restore.wait().await?, true)
+                    };
+                    Ok::<StreamDatabaseCopyExit, RepoboxError>(StreamDatabaseCopyExit::Completed {
+                        transfer_result,
+                        dump_status,
+                        restore_status,
+                        restore_was_terminated,
+                    })
+                } else {
+                    let (dump_status, restore_status) = tokio::join!(dump.wait(), restore.wait());
+                    Ok::<StreamDatabaseCopyExit, RepoboxError>(StreamDatabaseCopyExit::Completed {
+                        transfer_result,
+                        dump_status: Some(dump_status?),
+                        restore_status: restore_status?,
+                        restore_was_terminated: false,
+                    })
+                }
+            }
+            StreamDatabaseCopyRace::Restore(restore_status) => {
+                drop(transfer);
+                drop(dump_control);
+                let _ = dump.start_kill();
+                let _ = dump.wait().await;
+                Ok::<StreamDatabaseCopyExit, RepoboxError>(
+                    StreamDatabaseCopyExit::RestoreExitedEarly {
+                        restore_status: restore_status?,
+                    },
+                )
+            }
+            StreamDatabaseCopyRace::Cancelled => {
+                drop(transfer);
+                drop(dump_control);
+                let dump_kill = dump.start_kill();
+                let restore_kill = restore.start_kill();
+                let (dump_status, restore_status) = tokio::join!(dump.wait(), restore.wait());
+                interrupted_database_copy_cleanup(
+                    dump_kill,
+                    restore_kill,
+                    dump_status.map(|_| ()),
+                    restore_status.map(|_| ()),
+                )
+            }
+        }
+    });
+    let dump_stderr = Box::pin(collect_stderr_tail(dump_stderr));
+    let restore_stderr = Box::pin(collect_stderr_tail(restore_stderr));
+    let (stream_result, dump_stderr_result, restore_stderr_result) =
+        tokio::join!(stream, dump_stderr, restore_stderr,);
+
+    let stream_exit = stream_result?;
+    let dump_stderr = dump_stderr_result?;
+    let restore_stderr = restore_stderr_result?;
+    let (transfer_result, dump_status, restore_status, restore_was_terminated) = match stream_exit {
+        StreamDatabaseCopyExit::Completed {
+            transfer_result,
+            dump_status,
+            restore_status,
+            restore_was_terminated,
+        } => (
+            transfer_result,
+            dump_status,
+            restore_status,
+            restore_was_terminated,
+        ),
+        StreamDatabaseCopyExit::RestoreExitedEarly { restore_status } => {
+            if !restore_status.success() {
+                return Err(planetscale_import_failure(
+                    target,
+                    restore_status,
+                    &restore_stderr,
+                ));
+            }
+            return Err(RepoboxError::new(
+                ErrorKind::Runtime,
+                "database_stream_interrupted",
+                "psql exited successfully before pg_dump finished",
+            ));
+        }
+        StreamDatabaseCopyExit::Cancelled => return Err(operation_interrupted()),
+    };
+    let mut transfer_error = transfer_result.err();
+    match failed_stream_failure_source(restore_was_terminated, transfer_error.as_ref()) {
+        Some(FailedStreamFailureSource::Transfer) => {
+            return Err(transfer_error
+                .take()
+                .expect("transfer error was classified")
+                .into());
+        }
+        Some(FailedStreamFailureSource::StalledRestore) => {
+            return Err(database_stream_interrupted(
+                target,
+                format!(
+                    "database stream failed and psql did not exit within {} seconds",
+                    FAILED_STREAM_EXIT_GRACE_PERIOD.as_secs()
+                ),
+                &restore_stderr,
+            ));
+        }
+        None => {}
+    }
+    let transfer_broken_pipe = transfer_error
+        .as_ref()
+        .is_some_and(|error| error.kind() == std::io::ErrorKind::BrokenPipe);
+
+    if transfer_broken_pipe && !restore_status.success() {
+        return Err(planetscale_import_failure(
+            target,
+            restore_status,
+            &restore_stderr,
+        ));
+    }
+    if let Some(dump_status) = dump_status.filter(|status| !status.success()) {
+        return Err(RepoboxError::new(
+            ErrorKind::Runtime,
+            "local_postgres_dump_failed",
+            process_failure_message("pg_dump", dump_status, &dump_stderr),
+        ));
+    }
+    if transfer_error
+        .as_ref()
+        .is_some_and(|error| error.kind() != std::io::ErrorKind::BrokenPipe)
+    {
+        return Err(transfer_error.expect("transfer error was checked").into());
+    }
+    if !restore_status.success() {
+        return Err(planetscale_import_failure(
+            target,
+            restore_status,
+            &restore_stderr,
+        ));
+    }
+    if let Some(error) = transfer_error {
+        return Err(error.into());
+    }
+    Ok(())
+}
+
+fn interrupted_database_copy_cleanup(
+    dump_kill: std::io::Result<()>,
+    restore_kill: std::io::Result<()>,
+    dump_reap: std::io::Result<()>,
+    restore_reap: std::io::Result<()>,
+) -> Result<StreamDatabaseCopyExit> {
+    let mut cleanup_failures = Vec::new();
+    if let Err(error) = dump_kill {
+        cleanup_failures.push(format!("pg_dump process group kill failed: {error}"));
+    }
+    if let Err(error) = restore_kill {
+        cleanup_failures.push(format!("psql process group kill failed: {error}"));
+    }
+    if let Err(error) = dump_reap {
+        cleanup_failures.push(format!("pg_dump reap failed: {error}"));
+    }
+    if let Err(error) = restore_reap {
+        cleanup_failures.push(format!("psql reap failed: {error}"));
+    }
+    if cleanup_failures.is_empty() {
+        Ok(StreamDatabaseCopyExit::Cancelled)
+    } else {
+        Err(RepoboxError::new(
+            ErrorKind::Runtime,
+            "operation_interrupted_cleanup_incomplete",
+            format!(
+                "database import was interrupted, but managed pg_dump or psql processes may remain: {}",
+                cleanup_failures.join("; ")
+            ),
+        )
+        .with_suggestion(
+            "Inspect managed child process groups and Docker containers before resuming the exact durable job.",
+        ))
+    }
+}
+
+fn database_stream_interrupted(
+    target: &Url,
+    message: impl Into<String>,
+    stderr: &[u8],
+) -> RepoboxError {
+    let mut message = message.into();
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if !stderr.is_empty() {
+        message.push_str(": ");
+        message.push_str(stderr);
+    }
+    let mut redactor = repobox_core::redaction::SecretRedactor::default();
+    if let Some(password) = target.password() {
+        redactor.add(password);
+    }
+    RepoboxError::new(
+        ErrorKind::Runtime,
+        "database_stream_interrupted",
+        redactor.redact(&message),
+    )
+}
+
+async fn collect_stderr_tail<R>(mut stderr: R) -> std::io::Result<Vec<u8>>
+where
+    R: AsyncRead + Unpin,
+{
+    let mut tail = Vec::with_capacity(PROCESS_STDERR_TAIL_BYTES);
+    let mut total_bytes = 0_usize;
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let read = stderr.read(&mut buffer).await?;
+        if read == 0 {
+            break;
+        }
+        total_bytes = total_bytes.saturating_add(read);
+        tail.extend_from_slice(&buffer[..read]);
+        if tail.len() > PROCESS_STDERR_TAIL_BYTES {
+            let excess = tail.len() - PROCESS_STDERR_TAIL_BYTES;
+            tail.copy_within(excess.., 0);
+            tail.truncate(PROCESS_STDERR_TAIL_BYTES);
+        }
+    }
+    if total_bytes > tail.len() {
+        let marker = format!(
+            "[stderr truncated: retained last {} of {total_bytes} bytes]\n",
+            tail.len()
+        );
+        let mut retained = Vec::with_capacity(marker.len() + tail.len());
+        retained.extend_from_slice(marker.as_bytes());
+        retained.extend_from_slice(&tail);
+        return Ok(retained);
+    }
+    Ok(tail)
+}
+
+fn planetscale_import_failure(
+    target: &Url,
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> RepoboxError {
+    let mut redactor = repobox_core::redaction::SecretRedactor::default();
+    if let Some(password) = target.password() {
+        redactor.add(password);
+    }
+    let message = process_failure_message("psql", status, stderr);
+    RepoboxError::new(
+        ErrorKind::Runtime,
+        "planetscale_import_failed",
+        redactor.redact(&message),
+    )
+}
+
+fn process_failure_message(
+    process: &str,
+    status: std::process::ExitStatus,
+    stderr: &[u8],
+) -> String {
+    let stderr = String::from_utf8_lossy(stderr);
+    let stderr = stderr.trim();
+    if stderr.is_empty() {
+        format!("{process} exited with {status}")
+    } else {
+        format!("{process} exited with {status}: {stderr}")
+    }
+}
+
 pub fn environment_variables(
     config: &RepoboxConfig,
     record: &EnvironmentRecord,
@@ -1989,6 +3195,20 @@ pub fn environment_variables(
             "Run `repobox job view latest --json`, then resume the failed operation.",
         ));
     }
+    let expected_branch = provider_branch_name(config.project.id, &record.name)?;
+    if record.provider_branch != expected_branch {
+        return Err(RepoboxError::new(
+            ErrorKind::Conflict,
+            "environment_binding_config_mismatch",
+            format!(
+                "environment `{}` records provider branch `{}`, but current configuration resolves `{expected_branch}`",
+                record.name, record.provider_branch
+            ),
+        )
+        .with_suggestion(
+            "Do not start the runtime. Reconcile the project/environment identity or recreate the Repobox environment.",
+        ));
+    }
     let mut variables = BTreeMap::new();
     for (name, service) in &config.services {
         let binding = record.databases.get(name).ok_or_else(|| {
@@ -1998,11 +3218,31 @@ pub fn environment_variables(
                 format!("environment has no binding for service `{name}`"),
             )
         })?;
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            ..
+        } = &service.remote;
+        if binding.organization != *organization
+            || binding.database != *database
+            || binding.branch != expected_branch
+            || !binding.ready
+        {
+            return Err(RepoboxError::new(
+                ErrorKind::Conflict,
+                "environment_binding_config_mismatch",
+                format!(
+                    "stored binding for service `{name}` does not match configured {organization}/{database}/{expected_branch}"
+                ),
+            )
+            .with_suggestion(
+                "Do not start the runtime with stale credentials. Resume the matching durable job or delete and recreate the environment.",
+            ));
+        }
         let key = CredentialStore::database_key(config.project.id, &record.provider_branch, name);
         let (pooled, direct) = credentials.database_urls(&key)?;
         variables.insert(service.env.pooled.clone(), pooled);
         variables.insert(service.env.direct.clone(), direct);
-        let _ = binding;
     }
     Ok(variables)
 }
@@ -2096,12 +3336,444 @@ fn role_name(provider_branch: &str, service: &str) -> String {
     format!("repobox-{service}-{suffix}")
 }
 
+fn bootstrap_service_marker(service_name: &str, service: &ServiceConfig) -> String {
+    let RemoteServiceConfig::Planetscale {
+        organization,
+        database,
+        base_branch,
+        ..
+    } = &service.remote;
+    format!("{service_name}@{organization}/{database}/{base_branch}")
+}
+
+fn incomplete_environment_services(
+    record: &EnvironmentRecord,
+    config: &RepoboxConfig,
+    canonical: &str,
+) -> Vec<String> {
+    config
+        .services
+        .iter()
+        .filter_map(|(service_name, service)| {
+            let RemoteServiceConfig::Planetscale {
+                organization,
+                database,
+                ..
+            } = &service.remote;
+            let complete = record.databases.get(service_name).is_some_and(|binding| {
+                binding.organization == *organization
+                    && binding.database == *database
+                    && binding.branch == canonical
+                    && binding.ready
+            });
+            (!complete).then(|| service_name.clone())
+        })
+        .collect()
+}
+
+fn validate_selected_binding_identity(
+    record: &EnvironmentRecord,
+    selected: &BTreeMap<String, ServiceConfig>,
+    canonical: &str,
+    require_all: bool,
+) -> Result<()> {
+    if (require_all || !record.databases.is_empty()) && record.provider_branch != canonical {
+        return Err(RepoboxError::new(
+            ErrorKind::Conflict,
+            "environment_binding_config_mismatch",
+            format!(
+                "environment `{}` records provider branch `{}`, but the current project identity resolves `{canonical}`",
+                record.name, record.provider_branch
+            ),
+        )
+        .with_suggestion(
+            "Do not mutate a different provider target. Restore the matching configuration, or explicitly delete and recreate the environment.",
+        ));
+    }
+    for (service_name, service) in selected {
+        let Some(binding) = record.databases.get(service_name) else {
+            if require_all {
+                return Err(RepoboxError::new(
+                    ErrorKind::Conflict,
+                    "environment_binding_config_mismatch",
+                    format!(
+                        "environment `{}` has no durable binding for selected service `{service_name}`",
+                        record.name
+                    ),
+                )
+                .with_suggestion(
+                    "Do not start a new pull from incomplete state. Resume the exact durable job, or explicitly delete and recreate the environment.",
+                ));
+            }
+            continue;
+        };
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            ..
+        } = &service.remote;
+        if binding.organization != *organization
+            || binding.database != *database
+            || binding.branch != canonical
+            || !binding.ready
+        {
+            return Err(RepoboxError::new(
+                ErrorKind::Conflict,
+                "environment_binding_config_mismatch",
+                format!(
+                    "stored binding for service `{service_name}` points to {}/{}/{}, not configured {organization}/{database}/{canonical}",
+                    binding.organization, binding.database, binding.branch
+                ),
+            )
+            .with_suggestion(
+                "Do not overwrite the stored binding or credentials. Restore the matching configuration, or explicitly delete and recreate the environment.",
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn staging_branch_name(canonical: &str, job_id: uuid::Uuid) -> String {
     let job_id = job_id.simple().to_string();
     let suffix = format!("-next-{}", &job_id[job_id.len() - 8..]);
     let mut base = canonical.to_owned();
     base.truncate(63_usize.saturating_sub(suffix.len()));
     format!("{base}{suffix}")
+}
+
+fn nonterminal_environment_mutation_jobs(
+    jobs: &JobStore,
+    project_id: uuid::Uuid,
+    environment: &str,
+) -> Result<Vec<JobRecord>> {
+    Ok(jobs
+        .list()?
+        .into_iter()
+        .filter(|job| {
+            job.project_id == project_id
+                && job.environment == environment
+                && matches!(
+                    job.kind,
+                    JobKind::EnvironmentCreate | JobKind::EnvironmentPull
+                )
+                && !job.status.terminal()
+        })
+        .collect())
+}
+
+fn pull_job_has_residual_checkpoint(job: &JobRecord) -> bool {
+    job.steps.iter().any(|step| {
+        let phase = step
+            .resource
+            .get("phase")
+            .and_then(serde_json::Value::as_str);
+        phase != Some("complete")
+            && (phase.is_some()
+                || step
+                    .resource
+                    .get("staging")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some())
+    })
+}
+
+fn create_job_has_residual_checkpoint(job: &JobRecord) -> bool {
+    job.steps.iter().any(|step| {
+        step.resource
+            .get("phase")
+            .and_then(serde_json::Value::as_str)
+            != Some("complete")
+            && ["organization", "database", "canonical"]
+                .into_iter()
+                .all(|key| {
+                    step.resource
+                        .get(key)
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|value| !value.is_empty())
+                })
+    })
+}
+
+fn unreconciled_environment_create_jobs(
+    jobs: &JobStore,
+    project_id: uuid::Uuid,
+    environment: &str,
+) -> Result<Vec<JobRecord>> {
+    Ok(jobs
+        .list()?
+        .into_iter()
+        .filter(|job| {
+            job.project_id == project_id
+                && job.environment == environment
+                && job.kind == JobKind::EnvironmentCreate
+                && job.error_code.as_deref() != Some("environment_deleted")
+                && match job.status {
+                    JobStatus::Succeeded => false,
+                    JobStatus::Pending | JobStatus::Running | JobStatus::Degraded => true,
+                    JobStatus::Failed | JobStatus::Canceled => {
+                        create_job_has_residual_checkpoint(job)
+                    }
+                }
+        })
+        .collect())
+}
+
+fn unreconciled_environment_pull_jobs(
+    jobs: &JobStore,
+    project_id: uuid::Uuid,
+    environment: &str,
+) -> Result<Vec<JobRecord>> {
+    Ok(jobs
+        .list()?
+        .into_iter()
+        .filter(|job| {
+            job.project_id == project_id
+                && job.environment == environment
+                && job.kind == JobKind::EnvironmentPull
+                && job.error_code.as_deref() != Some("environment_deleted")
+                && match job.status {
+                    JobStatus::Succeeded => false,
+                    JobStatus::Pending | JobStatus::Running | JobStatus::Degraded => true,
+                    JobStatus::Failed | JobStatus::Canceled => {
+                        pull_job_has_residual_checkpoint(job)
+                    }
+                }
+        })
+        .collect())
+}
+
+fn unreconciled_environment_checkpoint_jobs(
+    jobs: &JobStore,
+    project_id: uuid::Uuid,
+    environment: &str,
+) -> Result<Vec<JobRecord>> {
+    let mut checkpoints = BTreeMap::new();
+    for job in unreconciled_environment_create_jobs(jobs, project_id, environment)?
+        .into_iter()
+        .chain(unreconciled_environment_pull_jobs(
+            jobs,
+            project_id,
+            environment,
+        )?)
+    {
+        checkpoints.insert(job.id, job);
+    }
+    Ok(checkpoints.into_values().collect())
+}
+
+fn mutation_jobs_to_reconcile(
+    lineages: &[JobRecord],
+    cleanup_pull_jobs: &[JobRecord],
+) -> Vec<JobRecord> {
+    let mut jobs = BTreeMap::new();
+    for job in lineages.iter().chain(cleanup_pull_jobs) {
+        jobs.insert(job.id, job.clone());
+    }
+    jobs.into_values().collect()
+}
+
+fn environment_recovery_required(job: &JobRecord, action: &str) -> RepoboxError {
+    let error = RepoboxError::new(
+        ErrorKind::Conflict,
+        "environment_recovery_required",
+        format!(
+            "{action} is blocked because environment `{}` has unresolved {:?} job {}",
+            job.environment, job.kind, job.id
+        ),
+    );
+    if job.status.terminal() {
+        error.with_suggestion(format!(
+            "Job {} is terminal and cannot be resumed. Run `repobox env delete {} --yes` to reconcile its persisted branches before starting over.",
+            job.id, job.environment
+        ))
+    } else {
+        error.with_suggestion(format!(
+            "Resume the exact lineage with `repobox job resume {} --yes`, or explicitly delete environment `{}` before starting over.",
+            job.id, job.environment
+        ))
+    }
+}
+
+fn mutation_lineage_conflict(environment: &str, lineages: &[JobRecord]) -> RepoboxError {
+    let ids = lineages
+        .iter()
+        .map(|job| format!("{:?} {}", job.kind, job.id))
+        .collect::<Vec<_>>()
+        .join(", ");
+    RepoboxError::new(
+        ErrorKind::Conflict,
+        "environment_mutation_lineage_conflict",
+        format!(
+            "environment `{environment}` has multiple unresolved mutation lineages: {ids}"
+        ),
+    )
+    .with_suggestion(format!(
+        "Inspect the exact job UUIDs, then run `repobox env delete {environment} --yes` to reconcile their persisted provider resources before starting over."
+    ))
+}
+
+pub fn guard_run_against_unresolved_mutation(
+    jobs: &JobStore,
+    project_id: uuid::Uuid,
+    environment: &str,
+) -> Result<()> {
+    let checkpoints = unreconciled_environment_checkpoint_jobs(jobs, project_id, environment)?;
+    match checkpoints.as_slice() {
+        [] => Ok(()),
+        [job] => Err(environment_recovery_required(
+            job,
+            "starting the local runtime",
+        )),
+        _ => Err(mutation_lineage_conflict(environment, &checkpoints)),
+    }
+}
+
+fn insert_deletion_target(
+    targets: &mut EnvironmentDeletionTargets,
+    service: &str,
+    target: BranchDeletionTarget,
+    checkpointed_credentials: bool,
+) {
+    let credentials = targets
+        .entry(service.to_owned())
+        .or_default()
+        .entry(target)
+        .or_default();
+    *credentials |= checkpointed_credentials;
+}
+
+fn environment_deletion_targets(
+    record: &EnvironmentRecord,
+    lineages: &[JobRecord],
+) -> Result<EnvironmentDeletionTargets> {
+    let mut targets = EnvironmentDeletionTargets::new();
+    for (service, binding) in &record.databases {
+        insert_deletion_target(
+            &mut targets,
+            service,
+            BranchDeletionTarget {
+                organization: binding.organization.clone(),
+                database: binding.database.clone(),
+                branch: binding.branch.clone(),
+            },
+            true,
+        );
+    }
+    let mut missing_identity = BTreeSet::new();
+    for lineage in lineages {
+        for step in &lineage.steps {
+            let (service_name, pull) = if let Some(service) = step.name.strip_prefix("provision:") {
+                (service, false)
+            } else if let Some(service) = step.name.strip_prefix("refresh:") {
+                (service, true)
+            } else {
+                continue;
+            };
+            let resource = &step.resource;
+            let binding = record.databases.get(service_name);
+            let organization = resource
+                .get("organization")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| binding.map(|binding| binding.organization.as_str()));
+            let database = resource
+                .get("database")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| binding.map(|binding| binding.database.as_str()));
+            let canonical = resource
+                .get("canonical")
+                .and_then(serde_json::Value::as_str)
+                .filter(|branch| !branch.is_empty())
+                .or_else(|| {
+                    (!pull)
+                        .then(|| {
+                            resource
+                                .get("branch")
+                                .and_then(serde_json::Value::as_str)
+                                .filter(|branch| !branch.is_empty())
+                        })
+                        .flatten()
+                });
+            let staging = pull
+                .then(|| {
+                    resource
+                        .get("staging")
+                        .and_then(serde_json::Value::as_str)
+                        .filter(|branch| !branch.is_empty())
+                })
+                .flatten();
+            let mut checkpoint_target = false;
+            if let (Some(organization), Some(database), Some(canonical)) =
+                (organization, database, canonical)
+            {
+                insert_deletion_target(
+                    &mut targets,
+                    service_name,
+                    BranchDeletionTarget {
+                        organization: organization.to_owned(),
+                        database: database.to_owned(),
+                        branch: canonical.to_owned(),
+                    },
+                    false,
+                );
+                checkpoint_target = true;
+            }
+            if let (Some(organization), Some(database), Some(staging)) =
+                (organization, database, staging)
+            {
+                let credentials_checkpointed = resource
+                    .get("phase")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|phase| {
+                        matches!(
+                            phase,
+                            "credentialed" | "old_deleted" | "renamed" | "swapped" | "complete"
+                        )
+                    });
+                insert_deletion_target(
+                    &mut targets,
+                    service_name,
+                    BranchDeletionTarget {
+                        organization: organization.to_owned(),
+                        database: database.to_owned(),
+                        branch: staging.to_owned(),
+                    },
+                    credentials_checkpointed,
+                );
+                checkpoint_target = true;
+            }
+            if binding.is_none() && !checkpoint_target {
+                missing_identity.insert(service_name.to_owned());
+            }
+        }
+    }
+    if targets.is_empty() && lineages.is_empty() {
+        return Err(RepoboxError::new(
+            ErrorKind::Conflict,
+            "environment_delete_identity_missing",
+            format!(
+                "environment `{}` has no durable provider binding or create/pull identity checkpoint",
+                record.name
+            ),
+        )
+        .with_suggestion(
+            "Inspect the local state, durable jobs, and PlanetScale branches manually. Repobox will not delete a branch inferred only from current configuration.",
+        ));
+    }
+    if !missing_identity.is_empty() {
+        return Err(RepoboxError::new(
+            ErrorKind::Conflict,
+            "environment_delete_identity_missing",
+            format!(
+                "environment `{}` has no durable provider identity for services: {}",
+                record.name,
+                missing_identity.into_iter().collect::<Vec<_>>().join(", ")
+            ),
+        )
+        .with_suggestion(
+            "Inspect the affected durable job and PlanetScale branches manually. Repobox will not delete a branch inferred only from current configuration.",
+        ));
+    }
+    Ok(targets)
 }
 
 fn set_step_resource(job: &mut JobRecord, step: &str, value: serde_json::Value) -> Result<()> {
@@ -2120,6 +3792,270 @@ fn set_step_resource(job: &mut JobRecord, step: &str, value: serde_json::Value) 
     job.sequence += 1;
     job.updated_at = Utc::now();
     Ok(())
+}
+
+fn prepare_create_job_resources(
+    job: &mut JobRecord,
+    selected: &BTreeMap<String, ServiceConfig>,
+    canonical: &str,
+    resumed: bool,
+) -> Result<()> {
+    for (service_name, service) in selected {
+        let step_name = format!("provision:{service_name}");
+        let step = job
+            .steps
+            .iter()
+            .find(|step| step.name == step_name)
+            .ok_or_else(|| {
+                RepoboxError::new(
+                    ErrorKind::NotFound,
+                    "job_step_not_found",
+                    format!("job step `{step_name}` does not exist"),
+                )
+            })?;
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            base_branch,
+            ..
+        } = &service.remote;
+        let expected = [
+            ("organization", organization.as_str()),
+            ("database", database.as_str()),
+            ("base_branch", base_branch.as_str()),
+            ("canonical", canonical),
+        ];
+        let has_identity = expected.iter().all(|(key, _)| {
+            step.resource
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        });
+        if !has_identity {
+            if resumed {
+                return Err(RepoboxError::new(
+                    ErrorKind::Conflict,
+                    "create_resume_identity_missing",
+                    format!(
+                        "create step `{step_name}` has no complete provider identity checkpoint"
+                    ),
+                )
+                .with_suggestion(
+                    "Do not guess a provider target. Inspect the durable job and use explicit environment deletion after identifying the owned branch.",
+                ));
+            }
+            set_step_resource(
+                job,
+                &step_name,
+                serde_json::json!({
+                    "phase": "planned",
+                    "organization": organization,
+                    "database": database,
+                    "base_branch": base_branch,
+                    "canonical": canonical,
+                }),
+            )?;
+            continue;
+        }
+        let mismatches = expected
+            .iter()
+            .filter(|(key, value)| {
+                step.resource.get(key).and_then(serde_json::Value::as_str) != Some(*value)
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        if !mismatches.is_empty() {
+            return Err(RepoboxError::new(
+                ErrorKind::Conflict,
+                "create_resume_identity_mismatch",
+                format!(
+                    "create step `{step_name}` provider identity differs from current configuration: {}",
+                    mismatches.join(", ")
+                ),
+            )
+            .with_suggestion(
+                "Restore the configuration that created this job, or explicitly delete the environment using its checkpointed provider identity.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn update_create_step_binding(
+    job: &mut JobRecord,
+    step: &str,
+    binding: &DatabaseBinding,
+) -> Result<()> {
+    let mut resource = job
+        .steps
+        .iter()
+        .find(|candidate| candidate.name == step)
+        .and_then(|step| step.resource.as_object())
+        .cloned()
+        .ok_or_else(|| {
+            RepoboxError::new(
+                ErrorKind::Conflict,
+                "create_step_identity_missing",
+                format!("create step `{step}` has no provider identity checkpoint"),
+            )
+        })?;
+    resource.insert(
+        "phase".to_owned(),
+        serde_json::Value::String("complete".to_owned()),
+    );
+    resource.insert(
+        "binding".to_owned(),
+        serde_json::to_value(binding).map_err(|error| {
+            RepoboxError::new(ErrorKind::Runtime, "job_encode_failed", error.to_string())
+        })?,
+    );
+    set_step_resource(job, step, serde_json::Value::Object(resource))
+}
+
+fn prepare_pull_job_resources(
+    job: &mut JobRecord,
+    selected: &BTreeMap<String, ServiceConfig>,
+    canonical: &str,
+    resumed: bool,
+) -> Result<()> {
+    let staging = staging_branch_name(canonical, job.id);
+    for (service_name, service) in selected {
+        let step_name = format!("refresh:{service_name}");
+        let step = job
+            .steps
+            .iter()
+            .find(|step| step.name == step_name)
+            .ok_or_else(|| {
+                RepoboxError::new(
+                    ErrorKind::NotFound,
+                    "job_step_not_found",
+                    format!("job step `{step_name}` does not exist"),
+                )
+            })?;
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            base_branch,
+            ..
+        } = &service.remote;
+        let expected = [
+            ("organization", organization.as_str()),
+            ("database", database.as_str()),
+            ("base_branch", base_branch.as_str()),
+            ("canonical", canonical),
+            ("staging", staging.as_str()),
+        ];
+        let has_identity = expected.iter().all(|(key, _)| {
+            step.resource
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .is_some()
+        });
+        if !has_identity {
+            if step.status == StepStatus::Succeeded {
+                continue;
+            }
+            if resumed {
+                return Err(RepoboxError::new(
+                    ErrorKind::Conflict,
+                    "pull_resume_identity_missing",
+                    format!(
+                        "pull job {} step `{step_name}` predates provider-identity checkpoints and cannot be resumed safely",
+                        job.id
+                    ),
+                )
+                .with_suggestion(
+                    "Inspect the staging and canonical branches in PlanetScale, then start a new pull only after reconciling any forward-only swap.",
+                ));
+            }
+            set_step_resource(
+                job,
+                &step_name,
+                serde_json::json!({
+                    "phase": "planned",
+                    "organization": organization,
+                    "database": database,
+                    "base_branch": base_branch,
+                    "canonical": canonical,
+                    "staging": staging,
+                }),
+            )?;
+            continue;
+        }
+        let mismatches = expected
+            .iter()
+            .filter(|(key, value)| {
+                step.resource.get(key).and_then(serde_json::Value::as_str) != Some(*value)
+            })
+            .map(|(key, _)| *key)
+            .collect::<Vec<_>>();
+        if !mismatches.is_empty() {
+            return Err(RepoboxError::new(
+                ErrorKind::Conflict,
+                "pull_resume_identity_mismatch",
+                format!(
+                    "pull job {} step `{step_name}` no longer matches the configured provider identity ({})",
+                    job.id,
+                    mismatches.join(", ")
+                ),
+            )
+            .with_suggestion(
+                "Restore the original Repobox provider configuration or reconcile the recorded staging/canonical branches manually; do not resume against a different database.",
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn update_pull_step_phase(
+    job: &mut JobRecord,
+    step: &str,
+    phase: &str,
+    updates: serde_json::Value,
+) -> Result<()> {
+    let mut resource = job
+        .steps
+        .iter()
+        .find(|candidate| candidate.name == step)
+        .and_then(|step| step.resource.as_object())
+        .cloned()
+        .ok_or_else(|| {
+            RepoboxError::new(
+                ErrorKind::Conflict,
+                "pull_step_identity_missing",
+                format!("pull step `{step}` has no provider identity checkpoint"),
+            )
+        })?;
+    resource.insert(
+        "phase".to_owned(),
+        serde_json::Value::String(phase.to_owned()),
+    );
+    if let Some(updates) = updates.as_object() {
+        resource.extend(updates.clone());
+    }
+    set_step_resource(job, step, serde_json::Value::Object(resource))
+}
+
+fn pull_step_may_require_forward_repair(job: &JobRecord, step: &str) -> bool {
+    job.steps
+        .iter()
+        .find(|candidate| candidate.name == step)
+        .and_then(|step| step.resource.get("phase"))
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|phase| matches!(phase, "credentialed" | "old_deleted"))
+}
+
+fn job_scope_matches(job: &JobRecord, step_prefix: &str, services: &[String]) -> bool {
+    let expected = services
+        .iter()
+        .map(|service| format!("{step_prefix}{service}"))
+        .collect::<BTreeSet<_>>();
+    let actual = job
+        .steps
+        .iter()
+        .map(|step| step.name.clone())
+        .collect::<BTreeSet<_>>();
+    expected == actual
 }
 
 fn provider_timeout(kind: &str, name: &str) -> RepoboxError {
@@ -2174,7 +4110,9 @@ mod tests {
         create_branch_calls: usize,
         create_role_names: Vec<String>,
         rename_branch_calls: Vec<(String, String)>,
+        delete_branch_calls: Vec<(String, String)>,
         delete_role_calls: usize,
+        cancel_after_delete: Option<OperationCancellation>,
     }
 
     #[derive(Default)]
@@ -2289,14 +4227,22 @@ mod tests {
         async fn delete_branch(
             &self,
             _organization: &str,
-            _database: &str,
+            database: &str,
             branch: &str,
         ) -> Result<()> {
             let mut state = self.state.lock().unwrap();
+            state
+                .delete_branch_calls
+                .push((database.to_owned(), branch.to_owned()));
             if let Some(error) = state.delete_branch_error.take() {
                 return Err(error);
             }
             state.branches.retain(|candidate| candidate.name != branch);
+            let cancellation = state.cancel_after_delete.take();
+            drop(state);
+            if let Some(cancellation) = cancellation {
+                cancellation.cancel();
+            }
             Ok(())
         }
 
@@ -2427,6 +4373,55 @@ mod tests {
         let mut config = RepoboxConfig::new_compose("test", vec![PathBuf::from("compose.yml")]);
         config.services.insert("db".to_owned(), test_service());
         config
+    }
+
+    fn two_service_config() -> RepoboxConfig {
+        let mut config = RepoboxConfig::new_compose("test", vec![PathBuf::from("compose.yml")]);
+        let mut first = test_service();
+        let RemoteServiceConfig::Planetscale { database, .. } = &mut first.remote;
+        "app-a".clone_into(database);
+        first.env.pooled = "DATABASE_A_URL".to_owned();
+        first.env.direct = "DIRECT_DATABASE_A_URL".to_owned();
+        let mut second = test_service();
+        let RemoteServiceConfig::Planetscale { database, .. } = &mut second.remote;
+        "app-b".clone_into(database);
+        second.env.pooled = "DATABASE_B_URL".to_owned();
+        second.env.direct = "DIRECT_DATABASE_B_URL".to_owned();
+        config.services.insert("a".to_owned(), first);
+        config.services.insert("b".to_owned(), second);
+        config
+    }
+
+    fn test_binding(service: &str, database: &str, branch: &str) -> DatabaseBinding {
+        DatabaseBinding {
+            service: service.to_owned(),
+            provider: "planetscale".to_owned(),
+            organization: "test-org".to_owned(),
+            database: database.to_owned(),
+            branch: branch.to_owned(),
+            role_id: format!("role-{service}"),
+            role_name: format!("repobox-{service}"),
+            ready: true,
+            updated_at: Utc::now(),
+        }
+    }
+
+    fn checkpoint_pull_test_phase(
+        job: &mut JobRecord,
+        config: &RepoboxConfig,
+        canonical: &str,
+        phase: &str,
+    ) {
+        prepare_pull_job_resources(job, &config.services, canonical, false).unwrap();
+        for service_name in config.services.keys() {
+            update_pull_step_phase(
+                job,
+                &format!("refresh:{service_name}"),
+                phase,
+                serde_json::Value::Null,
+            )
+            .unwrap();
+        }
     }
 
     fn fast_readiness() -> ProviderReadinessPolicy {
@@ -2582,50 +4577,208 @@ mod tests {
     }
 
     #[test]
-    fn normal_operations_still_select_the_newest_resumable_job() {
+    fn runtime_variables_reject_ready_binding_from_previous_database_config() {
+        let mut config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let mut record = EnvironmentRecord::new("feature", &canonical);
+        record.status = EnvironmentStatus::Ready;
+        record.databases.insert(
+            "db".to_owned(),
+            test_binding("db", "previous-database", &canonical),
+        );
+        let RemoteServiceConfig::Planetscale { database, .. } =
+            &mut config.services.get_mut("db").unwrap().remote;
+        *database = "new-database".to_owned();
+
+        let error = environment_variables(&config, &record, &credentials).unwrap_err();
+
+        assert_eq!(error.code, "environment_binding_config_mismatch");
+        assert!(error.message.contains("new-database"));
+    }
+
+    #[tokio::test]
+    async fn ensure_rejects_config_drift_before_provider_or_state_mutation() {
+        let mut config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let state_store = StateStore::new(&state_path);
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Ready;
+        environment
+            .databases
+            .insert("db".to_owned(), test_binding("db", "app", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let state_before = std::fs::read(&state_path).unwrap();
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            ..
+        } = &mut config.services.get_mut("db").unwrap().remote;
+        *organization = "replacement-org".to_owned();
+        *database = "replacement-app".to_owned();
+        let provider = FakeProvider::default();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        );
+
+        let error = manager
+            .ensure("feature", &ProvisionOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "environment_binding_config_mismatch");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        assert!(jobs.list().unwrap().is_empty());
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.database_list_calls, 0);
+        assert_eq!(provider_state.branch_list_calls, 0);
+        assert_eq!(provider_state.create_database_calls, 0);
+        assert_eq!(provider_state.create_branch_calls, 0);
+        assert!(provider_state.delete_branch_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn new_pull_rejects_config_drift_before_provider_or_state_mutation() {
+        let mut config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let state_path = temp.path().join("state.json");
+        let state_store = StateStore::new(&state_path);
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Ready;
+        environment
+            .databases
+            .insert("db".to_owned(), test_binding("db", "app", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let state_before = std::fs::read(&state_path).unwrap();
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            ..
+        } = &mut config.services.get_mut("db").unwrap().remote;
+        *organization = "replacement-org".to_owned();
+        *database = "replacement-app".to_owned();
+        let provider = FakeProvider::default();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        );
+
+        let error = manager
+            .pull("feature", &ProvisionOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "environment_binding_config_mismatch");
+        assert_eq!(std::fs::read(&state_path).unwrap(), state_before);
+        assert!(jobs.list().unwrap().is_empty());
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.database_list_calls, 0);
+        assert_eq!(provider_state.branch_list_calls, 0);
+        assert_eq!(provider_state.create_branch_calls, 0);
+        assert!(provider_state.delete_branch_calls.is_empty());
+        assert!(provider_state.rename_branch_calls.is_empty());
+    }
+
+    #[test]
+    fn create_and_pull_cannot_cross_an_unresolved_mutation_lineage() {
         let config = test_config();
         let provider = FakeProvider::default();
         let temp = tempfile::tempdir().unwrap();
         let credentials = CredentialStore::new(temp.path().join("credentials.json"));
         let output = Output::new(false, ColorChoice::Never);
         let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
-
-        let mut older_create = JobRecord::new(
-            JobKind::EnvironmentCreate,
-            config.project.id,
-            "feature",
-            ["provision:db"],
-        );
-        older_create.status = JobStatus::Degraded;
-        let mut newer_create = JobRecord::new(
-            JobKind::EnvironmentCreate,
-            config.project.id,
-            "feature",
-            ["provision:db"],
-        );
-        newer_create.status = JobStatus::Degraded;
-        newer_create.created_at = older_create.created_at + chrono::Duration::seconds(1);
-        newer_create.updated_at = newer_create.created_at;
-
-        let mut older_pull = JobRecord::new(
+        let mut pull = JobRecord::new(
             JobKind::EnvironmentPull,
             config.project.id,
-            "feature",
+            "blocked-create",
             ["refresh:db"],
         );
-        older_pull.status = JobStatus::Degraded;
-        let mut newer_pull = JobRecord::new(
-            JobKind::EnvironmentPull,
+        pull.status = JobStatus::Degraded;
+        jobs.append(&pull).unwrap();
+        let mut create = JobRecord::new(
+            JobKind::EnvironmentCreate,
             config.project.id,
-            "feature",
-            ["refresh:db"],
+            "blocked-pull",
+            ["provision:db"],
         );
-        newer_pull.status = JobStatus::Degraded;
-        newer_pull.created_at = older_pull.created_at + chrono::Duration::seconds(1);
-        newer_pull.updated_at = newer_pull.created_at;
+        create.status = JobStatus::Degraded;
+        jobs.append(&create).unwrap();
+        let manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            StateStore::new(temp.path().join("state.json")),
+            jobs.clone(),
+            &output,
+        );
 
-        for job in [&older_create, &newer_create, &older_pull, &newer_pull] {
-            jobs.append(job).unwrap();
+        let create_error = manager
+            .resumable_job(
+                JobKind::EnvironmentCreate,
+                "blocked-create",
+                "provision:",
+                config.services.keys(),
+            )
+            .unwrap_err();
+        let pull_error = manager
+            .resumable_job(
+                JobKind::EnvironmentPull,
+                "blocked-pull",
+                "refresh:",
+                config.services.keys(),
+            )
+            .unwrap_err();
+
+        assert_eq!(create_error.code, "environment_recovery_required");
+        assert!(create_error.message.contains(&pull.id.to_string()));
+        assert_eq!(pull_error.code, "environment_recovery_required");
+        assert!(pull_error.message.contains(&create.id.to_string()));
+        assert_eq!(jobs.list().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn multiple_nonterminal_jobs_are_never_silently_collapsed_into_one_lineage() {
+        let config = test_config();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let output = Output::new(false, ColorChoice::Never);
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        for _ in 0..2 {
+            let mut create = JobRecord::new(
+                JobKind::EnvironmentCreate,
+                config.project.id,
+                "feature",
+                ["provision:db"],
+            );
+            create.status = JobStatus::Degraded;
+            jobs.append(&create).unwrap();
         }
         let manager = EnvironmentManager::new(
             &config,
@@ -2637,27 +4790,16 @@ mod tests {
             &output,
         );
 
-        let (create, create_resumed) = manager
+        let error = manager
             .resumable_job(
                 JobKind::EnvironmentCreate,
                 "feature",
                 "provision:",
                 config.services.keys(),
             )
-            .unwrap();
-        let (pull, pull_resumed) = manager
-            .resumable_job(
-                JobKind::EnvironmentPull,
-                "feature",
-                "refresh:",
-                config.services.keys(),
-            )
-            .unwrap();
+            .unwrap_err();
 
-        assert!(create_resumed);
-        assert!(pull_resumed);
-        assert_eq!(create.id, newer_create.id);
-        assert_eq!(pull.id, newer_pull.id);
+        assert_eq!(error.code, "environment_mutation_lineage_conflict");
     }
 
     #[test]
@@ -2781,7 +4923,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resumed_create_waits_for_existing_resources_without_duplicate_posts() {
+    async fn resumed_create_clears_stale_error_without_duplicate_posts() {
         let config = test_config();
         let provider_branch = provider_branch_name(config.project.id, "feature").unwrap();
         let provider = FakeProvider::default();
@@ -2826,7 +4968,10 @@ mod tests {
             "feature",
             ["provision:db"],
         );
+        prepare_create_job_resources(&mut previous, &config.services, &provider_branch, false)
+            .unwrap();
         previous.status = JobStatus::Degraded;
+        previous.error_code = Some("planetscale_import_failed".to_owned());
         previous
             .update_step("provision:db", StepStatus::Running, None)
             .unwrap();
@@ -2844,7 +4989,7 @@ mod tests {
             "feature",
             ["provision:db"],
         );
-        newer.status = JobStatus::Degraded;
+        newer.status = JobStatus::Canceled;
         job_store.append(&newer).unwrap();
         let jobs = job_store.clone();
         let output = Output::new(false, ColorChoice::Never);
@@ -2867,7 +5012,9 @@ mod tests {
         assert!(mutation.resumed);
         assert_eq!(mutation.job.id, previous.id);
         assert_eq!(mutation.job.status, JobStatus::Succeeded);
-        assert_eq!(jobs.get(newer.id).unwrap().status, JobStatus::Degraded);
+        assert_eq!(mutation.job.error_code, None);
+        assert_eq!(jobs.get(previous.id).unwrap().error_code, None);
+        assert_eq!(jobs.get(newer.id).unwrap().status, JobStatus::Canceled);
         let state = provider.state.lock().unwrap();
         assert_eq!(state.database_list_calls, 2);
         assert_eq!(state.branch_get_calls, 3);
@@ -2894,12 +5041,7 @@ mod tests {
             ["refresh:db"],
         );
         let staging = staging_branch_name(&canonical, job.id);
-        set_step_resource(
-            &mut job,
-            "refresh:db",
-            serde_json::json!({"phase": "credentialed", "staging": staging}),
-        )
-        .unwrap();
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
         let desired_role_name = role_name(&canonical, "db");
         {
             let mut state = provider.state.lock().unwrap();
@@ -2950,7 +5092,7 @@ mod tests {
         assert_eq!(binding.role_name, desired_role_name);
         let state = provider.state.lock().unwrap();
         assert_eq!(state.create_branch_calls, 0);
-        assert_eq!(state.branch_get_calls, 2);
+        assert_eq!(state.branch_get_calls, 1);
         assert!(state.branches.iter().any(|branch| branch.name == canonical));
         assert!(!state.branches.iter().any(|branch| branch.name == staging));
         drop(state);
@@ -2975,20 +5117,16 @@ mod tests {
             ["refresh:db"],
         );
         approved.status = JobStatus::Degraded;
+        approved.error_code = Some("planetscale_import_failed".to_owned());
         let approved_staging = staging_branch_name(&canonical, approved.id);
-        set_step_resource(
-            &mut approved,
-            "refresh:db",
-            serde_json::json!({"phase": "credentialed", "staging": approved_staging}),
-        )
-        .unwrap();
+        checkpoint_pull_test_phase(&mut approved, &config, &canonical, "credentialed");
         let mut newer = JobRecord::new(
             JobKind::EnvironmentPull,
             config.project.id,
             "feature",
             ["refresh:db"],
         );
-        newer.status = JobStatus::Degraded;
+        newer.status = JobStatus::Succeeded;
         let newer_staging = staging_branch_name(&canonical, newer.id);
 
         {
@@ -3045,7 +5183,9 @@ mod tests {
             .unwrap();
 
         assert_eq!(mutation.job.id, approved.id);
-        assert_eq!(jobs.get(newer.id).unwrap().status, JobStatus::Degraded);
+        assert_eq!(mutation.job.error_code, None);
+        assert_eq!(jobs.get(approved.id).unwrap().error_code, None);
+        assert_eq!(jobs.get(newer.id).unwrap().status, JobStatus::Succeeded);
         let state = provider.state.lock().unwrap();
         assert_eq!(
             state.rename_branch_calls,
@@ -3062,6 +5202,399 @@ mod tests {
         assert!(credentials.database_urls(&staging_key).is_err());
         assert!(credentials.database_urls(&canonical_key).is_ok());
         credentials.remove_database_urls(&canonical_key).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pull_cancellation_finishes_forward_repair_and_skips_later_services() {
+        let config = two_service_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let cancellation = OperationCancellation::default();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:a", "refresh:b"],
+        );
+        job.status = JobStatus::Degraded;
+        let staging = staging_branch_name(&canonical, job.id);
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
+        {
+            let mut provider_state = provider.state.lock().unwrap();
+            provider_state
+                .databases
+                .extend([test_database("app-a", true), test_database("app-b", true)]);
+            provider_state
+                .branches
+                .extend([test_branch(&canonical, true), test_branch(&staging, true)]);
+            provider_state.cancel_after_delete = Some(cancellation.clone());
+        }
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut project_state = ProjectState::new(config.project.id);
+        project_state.environments.insert(
+            "feature".to_owned(),
+            EnvironmentRecord::new("feature", &canonical),
+        );
+        state_store.save(&project_state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        jobs.append(&job).unwrap();
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        )
+        .with_cancellation(cancellation);
+
+        let error = manager
+            .resume_pull(job.id, "feature", &ProvisionOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted");
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(
+            provider_state.delete_branch_calls,
+            vec![("app-a".to_owned(), canonical.clone())]
+        );
+        assert_eq!(
+            provider_state.rename_branch_calls,
+            vec![(staging, canonical)]
+        );
+        drop(provider_state);
+        let stored = jobs.get(job.id).unwrap();
+        assert_eq!(stored.status, JobStatus::Degraded);
+        assert_eq!(stored.error_code.as_deref(), Some("operation_interrupted"));
+        assert_eq!(stored.steps[0].status, StepStatus::Failed);
+        assert_eq!(stored.steps[0].resource["phase"], "renamed");
+        assert_eq!(stored.steps[1].status, StepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn pull_resume_rejects_remote_identity_changed_since_checkpoint() {
+        let mut config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:db"],
+        );
+        job.status = JobStatus::Degraded;
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
+        let RemoteServiceConfig::Planetscale { database, .. } =
+            &mut config.services.get_mut("db").unwrap().remote;
+        *database = "replacement-app".to_owned();
+
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut project_state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        project_state
+            .environments
+            .insert("feature".to_owned(), environment);
+        state_store.save(&project_state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        jobs.append(&job).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs,
+            &output,
+        );
+
+        let error = manager
+            .resume_pull(job.id, "feature", &ProvisionOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "pull_resume_identity_mismatch");
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.database_list_calls, 0);
+        assert_eq!(provider_state.branch_list_calls, 0);
+        assert_eq!(provider_state.branch_get_calls, 0);
+        assert_eq!(provider_state.create_branch_calls, 0);
+        assert!(provider_state.delete_branch_calls.is_empty());
+        assert!(provider_state.rename_branch_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn credentialed_pull_never_deletes_canonical_when_staging_is_missing() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&canonical, true));
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:db"],
+        );
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            StateStore::new(temp.path().join("state.json")),
+            jobs,
+            &output,
+        );
+
+        let error = manager
+            .pull_service(
+                &canonical,
+                "db",
+                config.services.get("db").unwrap(),
+                &ProvisionOptions::default(),
+                &mut job,
+                "refresh:db",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "pull_staging_branch_missing");
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.create_branch_calls, 0);
+        assert!(provider_state.delete_branch_calls.is_empty());
+        assert!(provider_state.rename_branch_calls.is_empty());
+        assert!(
+            provider_state
+                .branches
+                .iter()
+                .any(|branch| branch.name == canonical)
+        );
+    }
+
+    #[tokio::test]
+    async fn exact_pull_resume_preserves_succeeded_service_and_repairs_failed_service() {
+        let config = two_service_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:a", "refresh:b"],
+        );
+        job.status = JobStatus::Degraded;
+        job.error_code = Some("prior_failure".to_owned());
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
+        update_pull_step_phase(&mut job, "refresh:a", "complete", serde_json::Value::Null).unwrap();
+        job.update_step(
+            "refresh:a",
+            StepStatus::Succeeded,
+            Some("already swapped".to_owned()),
+        )
+        .unwrap();
+        job.update_step(
+            "refresh:b",
+            StepStatus::Failed,
+            Some("interrupted before swap".to_owned()),
+        )
+        .unwrap();
+        let succeeded_resource = job.steps[0].resource.clone();
+        let staging = staging_branch_name(&canonical, job.id);
+        {
+            let mut provider_state = provider.state.lock().unwrap();
+            provider_state
+                .branches
+                .extend([test_branch(&canonical, true), test_branch(&staging, true)]);
+            provider_state
+                .roles
+                .push(test_role(&role_name(&canonical, "b")));
+        }
+        let staging_key = CredentialStore::database_key(config.project.id, &staging, "b");
+        let canonical_key = CredentialStore::database_key(config.project.id, &canonical, "b");
+        credentials
+            .store_database_urls(
+                &staging_key,
+                "postgresql://test:password@example.test:6432/app",
+                "postgresql://test:password@example.test:5432/app",
+            )
+            .unwrap();
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut project_state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        environment
+            .databases
+            .insert("a".to_owned(), test_binding("a", "app-a", &canonical));
+        project_state
+            .environments
+            .insert("feature".to_owned(), environment);
+        state_store.save(&project_state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        jobs.append(&job).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        )
+        .with_readiness_policy(fast_readiness());
+
+        let mutation = manager
+            .resume_pull(job.id, "feature", &ProvisionOptions::default())
+            .await
+            .unwrap();
+
+        assert_eq!(mutation.job.status, JobStatus::Succeeded);
+        assert_eq!(mutation.job.error_code, None);
+        assert_eq!(mutation.job.steps[0].status, StepStatus::Succeeded);
+        assert_eq!(mutation.job.steps[0].resource, succeeded_resource);
+        assert_eq!(mutation.job.steps[1].status, StepStatus::Succeeded);
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app-b".to_owned(), canonical.clone())]
+        );
+        assert_eq!(
+            provider.state.lock().unwrap().rename_branch_calls,
+            vec![(staging, canonical)]
+        );
+        assert!(credentials.database_urls(&staging_key).is_err());
+        assert!(credentials.database_urls(&canonical_key).is_ok());
+        drop(manager);
+        credentials.remove_database_urls(&canonical_key).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pull_subset_cannot_reuse_degraded_full_scope_job() {
+        let config = two_service_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut project_state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        project_state
+            .environments
+            .insert("feature".to_owned(), environment);
+        state_store.save(&project_state).unwrap();
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:a", "refresh:b"],
+        );
+        job.status = JobStatus::Degraded;
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "credentialed");
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        jobs.append(&job).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs,
+            &output,
+        );
+        let options = ProvisionOptions {
+            selected_services: BTreeSet::from(["a".to_owned()]),
+            ..ProvisionOptions::default()
+        };
+
+        let error = manager.pull("feature", &options).await.unwrap_err();
+
+        assert_eq!(error.code, "environment_recovery_required");
+        assert!(error.suggestion.unwrap().contains(&job.id.to_string()));
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.database_list_calls, 0);
+        assert_eq!(provider_state.branch_list_calls, 0);
+        assert_eq!(provider_state.create_branch_calls, 0);
+        assert!(provider_state.delete_branch_calls.is_empty());
+        assert!(provider_state.rename_branch_calls.is_empty());
+    }
+
+    #[tokio::test]
+    async fn canceled_old_deleted_pull_repairs_rename_without_database_readiness() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let cancellation = OperationCancellation::default();
+        cancellation.cancel();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:db"],
+        );
+        let staging = staging_branch_name(&canonical, job.id);
+        checkpoint_pull_test_phase(&mut job, &config, &canonical, "old_deleted");
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&staging, true));
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            StateStore::new(temp.path().join("state.json")),
+            jobs,
+            &output,
+        )
+        .with_cancellation(cancellation);
+
+        let error = manager
+            .pull_service(
+                &canonical,
+                "db",
+                config.services.get("db").unwrap(),
+                &ProvisionOptions::default(),
+                &mut job,
+                "refresh:db",
+            )
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted");
+        let provider_state = provider.state.lock().unwrap();
+        assert_eq!(provider_state.database_list_calls, 0);
+        assert_eq!(
+            provider_state.rename_branch_calls,
+            vec![(staging, canonical)]
+        );
+        drop(provider_state);
+        assert_eq!(job.steps[0].resource["phase"], "renamed");
     }
 
     #[tokio::test]
@@ -3231,6 +5764,1027 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn delete_cleans_checkpointed_create_branch_missing_from_degraded_state() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .database_responses
+            .push_back(Err(RepoboxError::new(
+                ErrorKind::Permission,
+                "provider_permission_denied",
+                "simulated create failure before a binding was recorded",
+            )));
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store.clone(),
+            jobs.clone(),
+            &output,
+        );
+
+        let create_error = manager
+            .ensure("feature", &ProvisionOptions::default())
+            .await
+            .unwrap_err();
+
+        assert_eq!(create_error.code, "environment_provision_degraded");
+        let create = jobs.latest().unwrap();
+        assert_eq!(create.steps[0].resource["organization"], "test-org");
+        assert_eq!(create.steps[0].resource["database"], "app");
+        assert_eq!(create.steps[0].resource["canonical"], canonical);
+        assert!(
+            state_store.load(config.project.id).unwrap().environments["feature"]
+                .databases
+                .is_empty()
+        );
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&canonical, true));
+
+        let mutation = manager.delete("feature", false).await.unwrap();
+
+        assert_eq!(mutation.job.status, JobStatus::Succeeded);
+        assert_eq!(mutation.job.error_code, None);
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app".to_owned(), canonical)]
+        );
+        assert!(
+            state_store
+                .load(config.project.id)
+                .unwrap()
+                .environments
+                .is_empty()
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_rejects_legacy_environment_without_ownership_evidence() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&canonical, true));
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store.clone(),
+            JobStore::new(temp.path().join("jobs.jsonl")),
+            &output,
+        );
+
+        let error = manager.delete("feature", false).await.unwrap_err();
+
+        assert_eq!(error.code, "environment_delete_identity_missing");
+        assert!(
+            provider
+                .state
+                .lock()
+                .unwrap()
+                .delete_branch_calls
+                .is_empty()
+        );
+        assert!(
+            state_store
+                .load(config.project.id)
+                .unwrap()
+                .environments
+                .contains_key("feature")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_plan_and_execution_use_stored_binding_instead_of_drifted_config() {
+        let mut config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&canonical, true));
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let credential_key = CredentialStore::database_key(config.project.id, &canonical, "db");
+        credentials
+            .store_database_urls(
+                &credential_key,
+                "postgresql://test:password@example.test:6432/app",
+                "postgresql://test:password@example.test:5432/app",
+            )
+            .unwrap();
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Ready;
+        environment
+            .databases
+            .insert("db".to_owned(), test_binding("db", "app", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            ..
+        } = &mut config.services.get_mut("db").unwrap().remote;
+        *organization = "replacement-org".to_owned();
+        *database = "replacement-app".to_owned();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            JobStore::new(temp.path().join("jobs.jsonl")),
+            &output,
+        );
+
+        let plan = manager.delete_plan("feature").unwrap();
+
+        assert_eq!(plan.provider_calls.len(), 1);
+        assert_eq!(plan.provider_calls[0].action, "delete_branch");
+        assert_eq!(
+            plan.provider_calls[0].resource,
+            format!("test-org/app/{canonical} (db)")
+        );
+        assert!(!plan.provider_calls[0].resource.contains("replacement"));
+
+        let mutation = manager.delete("feature", false).await.unwrap();
+
+        assert_eq!(mutation.job.status, JobStatus::Succeeded);
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app".to_owned(), canonical)]
+        );
+        assert!(credentials.database_urls(&credential_key).is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_cleans_pull_staging_cancels_lineage_and_starts_fresh_afterward() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        environment
+            .databases
+            .insert("db".to_owned(), test_binding("db", "app", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let mut pull = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:db"],
+        );
+        pull.status = JobStatus::Degraded;
+        checkpoint_pull_test_phase(&mut pull, &config, &canonical, "old_deleted");
+        let staging = pull.steps[0].resource["staging"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        jobs.append(&pull).unwrap();
+        for branch in [&canonical, &staging] {
+            let key = CredentialStore::database_key(config.project.id, branch, "db");
+            credentials
+                .store_database_urls(
+                    &key,
+                    "postgresql://test:password@example.test:6432/app",
+                    "postgresql://test:password@example.test:5432/app",
+                )
+                .unwrap();
+        }
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store.clone(),
+            jobs.clone(),
+            &output,
+        );
+
+        manager.delete("feature", false).await.unwrap();
+
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![
+                ("app".to_owned(), canonical.clone()),
+                ("app".to_owned(), staging.clone()),
+            ]
+        );
+        for branch in [&canonical, &staging] {
+            let key = CredentialStore::database_key(config.project.id, branch, "db");
+            assert!(credentials.database_urls(&key).is_err());
+        }
+        assert_eq!(jobs.get(pull.id).unwrap().status, JobStatus::Canceled);
+        assert!(
+            state_store
+                .load(config.project.id)
+                .unwrap()
+                .environments
+                .is_empty()
+        );
+
+        let (fresh_create, create_resumed) = manager
+            .resumable_job(
+                JobKind::EnvironmentCreate,
+                "feature",
+                "provision:",
+                config.services.keys(),
+            )
+            .unwrap();
+        let (fresh_pull, pull_resumed) = manager
+            .resumable_job(
+                JobKind::EnvironmentPull,
+                "feature",
+                "refresh:",
+                config.services.keys(),
+            )
+            .unwrap();
+        assert!(!create_resumed);
+        assert!(!pull_resumed);
+        assert_ne!(fresh_create.id, pull.id);
+        assert_ne!(fresh_pull.id, pull.id);
+        assert_eq!(
+            jobs.get(pull.id).unwrap().error_code.as_deref(),
+            Some("environment_deleted")
+        );
+    }
+
+    #[tokio::test]
+    async fn delete_reconciles_a_directly_canceled_pull_before_environment_reuse() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        environment
+            .databases
+            .insert("db".to_owned(), test_binding("db", "app", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let mut pull = JobRecord::new(
+            JobKind::EnvironmentPull,
+            config.project.id,
+            "feature",
+            ["refresh:db"],
+        );
+        pull.status = JobStatus::Canceled;
+        checkpoint_pull_test_phase(&mut pull, &config, &canonical, "old_deleted");
+        let staging = pull.steps[0].resource["staging"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        jobs.append(&pull).unwrap();
+        for branch in [&canonical, &staging] {
+            let key = CredentialStore::database_key(config.project.id, branch, "db");
+            credentials
+                .store_database_urls(
+                    &key,
+                    "postgresql://test:password@example.test:6432/app",
+                    "postgresql://test:password@example.test:5432/app",
+                )
+                .unwrap();
+        }
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        );
+
+        manager.delete("feature", false).await.unwrap();
+
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![
+                ("app".to_owned(), canonical.clone()),
+                ("app".to_owned(), staging.clone()),
+            ]
+        );
+        let reconciled = jobs.get(pull.id).unwrap();
+        assert_eq!(reconciled.status, JobStatus::Canceled);
+        assert_eq!(
+            reconciled.error_code.as_deref(),
+            Some("environment_deleted")
+        );
+        guard_run_against_unresolved_mutation(&jobs, config.project.id, "feature").unwrap();
+        let (fresh, resumed) = manager
+            .resumable_job(
+                JobKind::EnvironmentCreate,
+                "feature",
+                "provision:",
+                config.services.keys(),
+            )
+            .unwrap();
+        assert!(!resumed);
+        assert_ne!(fresh.id, pull.id);
+    }
+
+    #[tokio::test]
+    async fn delete_reconciles_canceled_create_checkpoint_before_environment_reuse() {
+        let config = test_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let provider = FakeProvider::default();
+        provider
+            .state
+            .lock()
+            .unwrap()
+            .branches
+            .push(test_branch(&canonical, true));
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment.status = EnvironmentStatus::Degraded;
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let mut create = JobRecord::new(
+            JobKind::EnvironmentCreate,
+            config.project.id,
+            "feature",
+            ["provision:db"],
+        );
+        prepare_create_job_resources(&mut create, &config.services, &canonical, false).unwrap();
+        create.status = JobStatus::Canceled;
+        jobs.append(&create).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store,
+            jobs.clone(),
+            &output,
+        );
+
+        let run_error =
+            guard_run_against_unresolved_mutation(&jobs, config.project.id, "feature").unwrap_err();
+        assert_eq!(run_error.code, "environment_recovery_required");
+        assert!(run_error.message.contains(&create.id.to_string()));
+        let mutation_error = manager
+            .resumable_job(
+                JobKind::EnvironmentCreate,
+                "feature",
+                "provision:",
+                config.services.keys(),
+            )
+            .unwrap_err();
+        assert_eq!(mutation_error.code, "environment_recovery_required");
+
+        manager.delete("feature", false).await.unwrap();
+
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app".to_owned(), canonical)]
+        );
+        let reconciled = jobs.get(create.id).unwrap();
+        assert_eq!(reconciled.status, JobStatus::Canceled);
+        assert_eq!(
+            reconciled.error_code.as_deref(),
+            Some("environment_deleted")
+        );
+        guard_run_against_unresolved_mutation(&jobs, config.project.id, "feature").unwrap();
+        let (fresh, resumed) = manager
+            .resumable_job(
+                JobKind::EnvironmentCreate,
+                "feature",
+                "provision:",
+                config.services.keys(),
+            )
+            .unwrap();
+        assert!(!resumed);
+        assert_ne!(fresh.id, create.id);
+    }
+
+    #[tokio::test]
+    async fn delete_cancellation_finishes_current_service_and_skips_later_services() {
+        let config = two_service_config();
+        let canonical = provider_branch_name(config.project.id, "feature").unwrap();
+        let cancellation = OperationCancellation::default();
+        let provider = FakeProvider::default();
+        provider.state.lock().unwrap().cancel_after_delete = Some(cancellation.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        for service in ["a", "b"] {
+            let key = CredentialStore::database_key(config.project.id, &canonical, service);
+            credentials
+                .store_database_urls(
+                    &key,
+                    "postgresql://test:password@example.test:6432/app",
+                    "postgresql://test:password@example.test:5432/app",
+                )
+                .unwrap();
+        }
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        let mut environment = EnvironmentRecord::new("feature", &canonical);
+        environment
+            .databases
+            .insert("a".to_owned(), test_binding("a", "app-a", &canonical));
+        environment
+            .databases
+            .insert("b".to_owned(), test_binding("b", "app-b", &canonical));
+        state.environments.insert("feature".to_owned(), environment);
+        state_store.save(&state).unwrap();
+        let jobs = JobStore::new(temp.path().join("jobs.jsonl"));
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store.clone(),
+            jobs.clone(),
+            &output,
+        )
+        .with_cancellation(cancellation);
+
+        let error = manager.delete("feature", false).await.unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted");
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app-a".to_owned(), canonical)]
+        );
+        assert!(
+            state_store
+                .load(config.project.id)
+                .unwrap()
+                .environments
+                .contains_key("feature")
+        );
+        let job = jobs.latest().unwrap();
+        assert_eq!(job.status, JobStatus::Degraded);
+        assert_eq!(job.error_code.as_deref(), Some("operation_interrupted"));
+        assert_eq!(job.steps[0].status, StepStatus::Succeeded);
+        assert_eq!(job.steps[1].status, StepStatus::Pending);
+    }
+
+    #[tokio::test]
+    async fn delete_many_cancellation_skips_later_environments() {
+        let config = test_config();
+        let first_branch = provider_branch_name(config.project.id, "feature-a").unwrap();
+        let second_branch = provider_branch_name(config.project.id, "feature-b").unwrap();
+        let cancellation = OperationCancellation::default();
+        let provider = FakeProvider::default();
+        provider.state.lock().unwrap().cancel_after_delete = Some(cancellation.clone());
+        let temp = tempfile::tempdir().unwrap();
+        let credentials = CredentialStore::new(temp.path().join("credentials.json"));
+        for branch in [&first_branch, &second_branch] {
+            let key = CredentialStore::database_key(config.project.id, branch, "db");
+            credentials
+                .store_database_urls(
+                    &key,
+                    "postgresql://test:password@example.test:6432/app",
+                    "postgresql://test:password@example.test:5432/app",
+                )
+                .unwrap();
+        }
+        let state_store = StateStore::new(temp.path().join("state.json"));
+        let mut state = ProjectState::new(config.project.id);
+        for (environment_name, branch) in [
+            ("feature-a", first_branch.as_str()),
+            ("feature-b", second_branch.as_str()),
+        ] {
+            let mut environment = EnvironmentRecord::new(environment_name, branch);
+            environment
+                .databases
+                .insert("db".to_owned(), test_binding("db", "app", branch));
+            state
+                .environments
+                .insert(environment_name.to_owned(), environment);
+        }
+        state_store.save(&state).unwrap();
+        let output = Output::new(false, ColorChoice::Never);
+        let mut manager = EnvironmentManager::new(
+            &config,
+            temp.path(),
+            &provider,
+            &credentials,
+            state_store.clone(),
+            JobStore::new(temp.path().join("jobs.jsonl")),
+            &output,
+        )
+        .with_cancellation(cancellation);
+
+        let error = manager
+            .delete_many(&["feature-a".to_owned(), "feature-b".to_owned()])
+            .await
+            .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted");
+        assert_eq!(
+            provider.state.lock().unwrap().delete_branch_calls,
+            vec![("app".to_owned(), first_branch)]
+        );
+        let state = state_store.load(config.project.id).unwrap();
+        assert!(!state.environments.contains_key("feature-a"));
+        assert!(state.environments.contains_key("feature-b"));
+    }
+
+    #[test]
+    fn psql_major_version_parser_accepts_release_and_prerelease_output() {
+        assert_eq!(
+            parse_psql_major_version(b"psql (PostgreSQL) 16.4\n"),
+            Some(16)
+        );
+        assert_eq!(
+            parse_psql_major_version(b"psql (PostgreSQL) 18beta1\n"),
+            Some(18)
+        );
+        assert_eq!(
+            parse_psql_major_version(b"psql (PostgreSQL) 15.13 (Ubuntu 15.13-1)\n"),
+            Some(15)
+        );
+        assert_eq!(parse_psql_major_version(b"unexpected output"), None);
+        assert!(!psql_major_version_is_compatible(15, true));
+        assert!(psql_major_version_is_compatible(16, true));
+        assert!(psql_major_version_is_compatible(15, false));
+    }
+
+    #[tokio::test]
+    async fn local_postgres_readiness_retries_until_accepting_connections() {
+        let cancellation = OperationCancellation::default();
+        let attempts = std::cell::Cell::new(0_u8);
+
+        wait_for_local_postgres_readiness(
+            &cancellation,
+            "postgres",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                let next = attempts.get() + 1;
+                attempts.set(next);
+                async move { Ok(next == 3) }
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(attempts.get(), 3);
+    }
+
+    #[tokio::test]
+    async fn local_postgres_readiness_is_cancellation_aware() {
+        let cancellation = OperationCancellation::default();
+        cancellation.cancel();
+        let attempts = std::cell::Cell::new(0_u8);
+
+        let error = wait_for_local_postgres_readiness(
+            &cancellation,
+            "postgres",
+            Duration::from_secs(1),
+            Duration::ZERO,
+            || {
+                attempts.set(attempts.get() + 1);
+                std::future::ready(Ok(true))
+            },
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted");
+        assert_eq!(attempts.get(), 0);
+    }
+
+    #[tokio::test]
+    async fn local_postgres_readiness_timeout_is_actionable() {
+        let cancellation = OperationCancellation::default();
+
+        let error = wait_for_local_postgres_readiness(
+            &cancellation,
+            "postgres",
+            Duration::ZERO,
+            Duration::ZERO,
+            || std::future::ready(Ok(false)),
+        )
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "local_postgres_readiness_timeout");
+        assert!(error.message.contains("postgres"));
+        assert!(error.suggestion.unwrap().contains("docker compose logs"));
+    }
+
+    #[test]
+    fn interrupted_database_copy_cleanup_failure_reports_residual_processes() {
+        let error = interrupted_database_copy_cleanup(
+            Err(std::io::Error::other("kill denied")),
+            Ok(()),
+            Ok(()),
+            Ok(()),
+        )
+        .err()
+        .unwrap();
+
+        assert_eq!(error.code, "operation_interrupted_cleanup_incomplete");
+        assert!(error.message.contains("pg_dump process group"));
+        assert!(error.message.contains("kill denied"));
+    }
+
+    #[test]
+    fn docker_cleanup_timeout_names_the_possible_residual_container() {
+        let error = docker_cleanup_attempt_result(
+            "repobox-psql-timeout",
+            DockerCleanupAttempt::TimedOut,
+            false,
+        )
+        .unwrap()
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(error.to_string().contains("repobox-psql-timeout"));
+        assert!(error.to_string().contains("may still be running"));
+    }
+
+    #[test]
+    fn docker_cleanup_failure_retries_then_reports_the_container() {
+        assert!(
+            docker_cleanup_attempt_result(
+                "repobox-psql-failure",
+                DockerCleanupAttempt::Failed,
+                false,
+            )
+            .is_none()
+        );
+        let error = docker_cleanup_attempt_result(
+            "repobox-psql-failure",
+            DockerCleanupAttempt::Failed,
+            true,
+        )
+        .unwrap()
+        .unwrap_err();
+
+        assert!(error.to_string().contains("repobox-psql-failure"));
+        assert!(error.to_string().contains("5 attempts"));
+    }
+
+    #[test]
+    fn docker_cleanup_treats_confirmed_absence_as_success() {
+        let outcome = classify_docker_cleanup_commands(
+            Some(false),
+            Some(false),
+            "Error: No such object: repobox-psql-gone",
+        );
+        docker_cleanup_attempt_result("repobox-psql-gone", outcome, true)
+            .unwrap()
+            .unwrap();
+
+        let mut cleanup = DockerContainerCleanup::new("must-not-run-docker".to_owned());
+        cleanup.disarm();
+        cleanup.run().unwrap();
+    }
+
+    #[test]
+    fn docker_cleanup_existing_or_unknown_container_is_not_reported_clean() {
+        for outcome in [
+            classify_docker_cleanup_commands(Some(false), Some(true), ""),
+            classify_docker_cleanup_commands(
+                Some(false),
+                Some(false),
+                "cannot connect to the Docker daemon",
+            ),
+        ] {
+            let error = docker_cleanup_attempt_result("repobox-psql-uncertain", outcome, true)
+                .unwrap()
+                .unwrap_err();
+            assert!(error.to_string().contains("repobox-psql-uncertain"));
+        }
+    }
+
+    #[cfg(unix)]
+    fn streaming_test_processes(restore_script: &str) -> (ManagedChild, ManagedChild) {
+        let mut dump_command = Command::new("sh");
+        dump_command
+            .args([
+                "-c",
+                "trap '' PIPE; while printf 'SELECT 1;\\n'; do :; done; exec sleep 30",
+            ])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let dump = ManagedChild::spawn(dump_command, None).unwrap();
+        let mut restore_command = Command::new("sh");
+        restore_command
+            .args(["-c", restore_script])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let restore = ManagedChild::spawn(restore_command, None).unwrap();
+        (dump, restore)
+    }
+
+    #[test]
+    fn non_broken_pipe_transfer_failure_wins_when_restore_is_terminated() {
+        let transfer_error =
+            std::io::Error::new(std::io::ErrorKind::ConnectionReset, "transport failed");
+
+        assert_eq!(
+            failed_stream_failure_source(true, Some(&transfer_error)),
+            Some(FailedStreamFailureSource::Transfer)
+        );
+    }
+
+    #[test]
+    fn interrupted_cleanup_failure_names_possible_residual() {
+        let error = finish_with_cleanup::<()>(
+            Err(operation_interrupted()),
+            Err(RepoboxError::new(
+                ErrorKind::Runtime,
+                "cleanup_transport_failed",
+                "provider unavailable",
+            )),
+            "temporary PlanetScale role `repobox-import-test`",
+        )
+        .unwrap_err();
+
+        assert_eq!(error.code, "operation_interrupted_cleanup_incomplete");
+        assert!(error.message.contains("temporary PlanetScale role"));
+        assert!(error.message.contains("provider unavailable"));
+    }
+
+    #[tokio::test]
+    async fn partial_compose_start_failure_stops_source_and_preserves_start_error() {
+        let cleanup_attempted = std::sync::atomic::AtomicBool::new(false);
+        let start_error = RepoboxError::new(
+            ErrorKind::Runtime,
+            "local_postgres_start_failed",
+            "Docker Compose exited with exit status: 17",
+        );
+
+        let error = finish_failed_compose_start(start_error, "postgres", async {
+            cleanup_attempted.store(true, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        })
+        .await
+        .unwrap_err();
+
+        assert!(cleanup_attempted.load(std::sync::atomic::Ordering::SeqCst));
+        assert_eq!(error.code, "local_postgres_start_failed");
+        assert!(error.message.contains("exit status: 17"));
+    }
+
+    #[tokio::test]
+    async fn partial_compose_start_failure_reports_unconfirmed_cleanup() {
+        let start_error = RepoboxError::new(
+            ErrorKind::Runtime,
+            "local_postgres_start_failed",
+            "Docker Compose exited with exit status: 17",
+        );
+
+        let error = finish_failed_compose_start(start_error, "postgres", async {
+            Err(RepoboxError::new(
+                ErrorKind::Runtime,
+                "local_postgres_stop_failed",
+                "Docker Compose exited with exit status: 18",
+            ))
+        })
+        .await
+        .unwrap_err();
+
+        assert_eq!(error.code, "operation_cleanup_failed");
+        assert!(error.message.contains("exit status: 17"));
+        assert!(error.message.contains("Compose source service `postgres`"));
+        assert!(error.message.contains("exit status: 18"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_restore_diagnostic_survives_broken_pipe() {
+        let (dump, restore) = streaming_test_processes(
+            "printf 'restore-rejected-sentinel topsecret\\n' >&2; exit 42",
+        );
+        let target = Url::parse("postgresql://repobox:topsecret@example.test:5432/app").unwrap();
+        let cancellation = OperationCancellation::default();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(5),
+            stream_database_copy(dump, restore, &target, &cancellation),
+        )
+        .await
+        .expect("database copy should not hang")
+        .unwrap_err();
+
+        assert_eq!(error.code, "planetscale_import_failed");
+        assert!(error.message.contains("restore-rejected-sentinel"));
+        assert!(error.message.contains("exit status: 42"));
+        assert!(!error.message.contains("Broken pipe"));
+        assert!(!error.message.contains("topsecret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn failed_restore_drains_more_than_pipe_capacity_from_stderr() {
+        let (dump, restore) = streaming_test_processes(
+            "i=0; while [ \"$i\" -lt 7000 ]; do \
+             printf 'restore-stderr-padding-0123456789\\n' >&2; \
+             i=$((i + 1)); done; \
+             printf 'large-stderr-sentinel\\n' >&2; exit 43",
+        );
+        let target = Url::parse("postgresql://repobox:topsecret@example.test:5432/app").unwrap();
+        let cancellation = OperationCancellation::default();
+
+        let error = tokio::time::timeout(
+            Duration::from_secs(10),
+            stream_database_copy(dump, restore, &target, &cancellation),
+        )
+        .await
+        .expect("database copy should drain stderr without hanging")
+        .unwrap_err();
+
+        assert_eq!(error.code, "planetscale_import_failed");
+        assert!(error.message.contains("large-stderr-sentinel"));
+        assert!(error.message.contains("exit status: 43"));
+        assert!(error.message.contains("[stderr truncated:"));
+        assert!(error.message.len() <= PROCESS_STDERR_TAIL_BYTES + 256);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn broken_pipe_does_not_wait_forever_for_restore() {
+        let (dump, restore) = streaming_test_processes(
+            "printf 'stalled-restore-sentinel topsecret\\n' >&2; exec 0<&-; sleep 30",
+        );
+        let target = Url::parse("postgresql://repobox:topsecret@example.test:5432/app").unwrap();
+        let cancellation = OperationCancellation::default();
+
+        let error = tokio::time::timeout(
+            FAILED_STREAM_EXIT_GRACE_PERIOD + Duration::from_secs(2),
+            stream_database_copy(dump, restore, &target, &cancellation),
+        )
+        .await
+        .expect("database copy should terminate a stalled restore")
+        .unwrap_err();
+
+        assert_eq!(error.code, "database_stream_interrupted");
+        assert!(error.message.contains("psql did not exit"));
+        assert!(error.message.contains("stalled-restore-sentinel"));
+        assert!(!error.message.contains("topsecret"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn controlled_command_stops_child_when_control_closes() {
+        let mut command = Command::new("sh");
+        command
+            .args([
+                "-c",
+                CONTROLLED_COMMAND_SCRIPT,
+                "repobox-test",
+                "sh",
+                "-c",
+                "printf '%s\\n' \"$$\"; exec sleep 30",
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = ManagedChild::spawn(command, None).unwrap();
+        let control = child.child.stdin.take().unwrap();
+        let mut stdout = child.child.stdout.take().unwrap();
+        let mut pid_bytes = [0_u8; 32];
+        let bytes_read = tokio::time::timeout(Duration::from_secs(1), stdout.read(&mut pid_bytes))
+            .await
+            .expect("wrapped command should report its pid")
+            .unwrap();
+        let child_pid = std::str::from_utf8(&pid_bytes[..bytes_read])
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+
+        drop(control);
+        tokio::time::timeout(Duration::from_secs(2), child.wait())
+            .await
+            .expect("control EOF should stop the wrapped command")
+            .unwrap();
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(child_pid), None),
+            Err(nix::errno::Errno::ESRCH)
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancelling_database_copy_kills_child_process_groups() {
+        let temp = tempfile::tempdir().unwrap();
+        let dump_pid_path = temp.path().join("dump-child.pid");
+        let restore_pid_path = temp.path().join("restore-child.pid");
+
+        let mut dump_command = Command::new("sh");
+        dump_command
+            .args([
+                "-c",
+                "trap '' PIPE; sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; \
+                 while printf 'SELECT 1;\\n'; do :; done; wait \"$child\"",
+                "sh",
+            ])
+            .arg(&dump_pid_path)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let dump = ManagedChild::spawn(dump_command, None).unwrap();
+        let mut restore_command = Command::new("sh");
+        restore_command
+            .args([
+                "-c",
+                "sleep 30 & child=$!; printf '%s' \"$child\" > \"$1\"; wait \"$child\"",
+                "sh",
+            ])
+            .arg(&restore_pid_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped());
+        let restore = ManagedChild::spawn(restore_command, None).unwrap();
+        let target = Url::parse("postgresql://repobox:topsecret@example.test:5432/app").unwrap();
+        let cancellation = OperationCancellation::default();
+        let operation_cancellation = cancellation.clone();
+
+        let copy = tokio::spawn(async move {
+            stream_database_copy(dump, restore, &target, &operation_cancellation).await
+        });
+        for _ in 0..100 {
+            if dump_pid_path.is_file() && restore_pid_path.is_file() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let dump_pid = std::fs::read_to_string(&dump_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+        let restore_pid = std::fs::read_to_string(&restore_pid_path)
+            .unwrap()
+            .parse::<i32>()
+            .unwrap();
+
+        cancellation.cancel();
+        let error = copy.await.unwrap().unwrap_err();
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        assert_eq!(error.code, "operation_interrupted");
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(dump_pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "cancelled pg_dump descendant kept running"
+        );
+        assert_eq!(
+            nix::sys::signal::kill(nix::unistd::Pid::from_raw(restore_pid), None),
+            Err(nix::errno::Errno::ESRCH),
+            "cancelled psql descendant kept running"
+        );
+    }
+
     #[test]
     fn smallest_cluster_size_uses_numeric_capacity() {
         let sizes = vec![
@@ -3260,5 +6814,29 @@ mod tests {
         let second = staging_branch_name(&"x".repeat(63), uuid::Uuid::from_u128(2));
         assert!(first.len() <= 63);
         assert_ne!(first, second);
+    }
+
+    #[test]
+    fn bootstrap_marker_changes_with_remote_target_identity() {
+        let original = test_service();
+        let mut moved = original.clone();
+        let RemoteServiceConfig::Planetscale {
+            organization,
+            database,
+            base_branch,
+            ..
+        } = &mut moved.remote;
+        *organization = "another-org".to_owned();
+        *database = "another-database".to_owned();
+        *base_branch = "production".to_owned();
+
+        assert_ne!(
+            bootstrap_service_marker("db", &original),
+            bootstrap_service_marker("db", &moved)
+        );
+        assert_eq!(
+            bootstrap_service_marker("db", &original),
+            "db@test-org/app/main"
+        );
     }
 }

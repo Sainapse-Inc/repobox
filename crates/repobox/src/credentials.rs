@@ -247,6 +247,13 @@ impl CredentialStore {
         self.remove_stored_value(key)
     }
 
+    pub(crate) fn has_database_url_evidence(&self, key: &str) -> Result<bool> {
+        let file = self.read_file()?;
+        Ok(file.items.contains_key(key)
+            || file.keyring_items.contains(key)
+            || file.removed_items.contains(key))
+    }
+
     fn remove_stored_value(&self, key: &str) -> Result<()> {
         self.remove_stored_value_with(key, &SystemKeyring)
     }

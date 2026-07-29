@@ -9,7 +9,7 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
     about = "Persistent, branch-scoped development environments",
     long_about = "Repobox keeps application processes local while moving stateful services into persistent, branch-scoped remote environments. Every command is scriptable; add --json for stable machine-readable output.",
     disable_help_subcommand = true,
-    after_help = "QUICK START:\n  repobox auth login\n  cd <repository>\n  repobox run\n\nAGENT START:\n  repobox agent-context --json\n  repobox config detect --json --no-input\n  repobox run --detach --yes --json --no-input\n\nRun `repobox help <topic>` for workflows: setup, agents, data, environments, config, exit-codes."
+    after_help = "QUICK START:\n  repobox auth login\n  cd <repository>\n  repobox run\n\nAGENT START:\n  repobox agent-context --json\n  repobox config detect --json --no-input\n  repobox run --yes --json --no-input --no-tui\n\n`agent-context` reports whether the configured runtime supports `--detach`.\n\nRun `repobox help <topic>` for workflows: setup, agents, data, connections, environments, config, exit-codes."
 )]
 pub struct Cli {
     /// Emit stable JSON (or JSONL for streaming commands).
@@ -525,6 +525,6 @@ pub struct AgentContextArgs {
 
 #[derive(Clone, Debug, Args)]
 pub struct HelpArgs {
-    /// setup, agents, data, environment, environments, formatting, config, or exit-codes.
+    /// setup, agents, data, connections, environment, environments, formatting, config, or exit-codes.
     pub topic: Option<String>,
 }

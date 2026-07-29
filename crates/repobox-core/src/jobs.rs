@@ -157,6 +157,16 @@ impl JobStore {
             .create(true)
             .append(true)
             .open(&self.path)?;
+        let normalized;
+        let job = if job.status == JobStatus::Succeeded && job.error_code.is_some() {
+            normalized = JobRecord {
+                error_code: None,
+                ..job.clone()
+            };
+            &normalized
+        } else {
+            job
+        };
         serde_json::to_writer(&mut file, job).map_err(|error| {
             RepoboxError::new(ErrorKind::Runtime, "job_encode_failed", error.to_string())
         })?;
@@ -177,13 +187,16 @@ impl JobStore {
             if line.trim().is_empty() {
                 continue;
             }
-            let record: JobRecord = serde_json::from_str(&line).map_err(|error| {
+            let mut record: JobRecord = serde_json::from_str(&line).map_err(|error| {
                 RepoboxError::new(
                     ErrorKind::Runtime,
                     "job_ledger_corrupt",
                     format!("invalid job ledger record on line {}: {error}", index + 1),
                 )
             })?;
+            if record.status == JobStatus::Succeeded {
+                record.error_code = None;
+            }
             latest.insert(record.id, record);
         }
         let mut records: Vec<_> = latest.into_values().collect();
@@ -238,5 +251,35 @@ mod tests {
         assert_eq!(jobs.len(), 1);
         assert_eq!(jobs[0].status, JobStatus::Running);
         assert_eq!(jobs[0].steps[0].attempts, 1);
+    }
+
+    #[test]
+    fn succeeded_legacy_records_never_expose_stale_error_codes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("jobs.jsonl");
+        let store = JobStore::new(&path);
+        let mut job = JobRecord::new(
+            JobKind::EnvironmentCreate,
+            Uuid::new_v4(),
+            "feature",
+            ["create_branch"],
+        );
+        job.status = JobStatus::Succeeded;
+        job.error_code = Some("planetscale_import_failed".to_owned());
+
+        fs::write(&path, format!("{}\n", serde_json::to_string(&job).unwrap())).unwrap();
+
+        let loaded = store.get(job.id).unwrap();
+        assert_eq!(loaded.status, JobStatus::Succeeded);
+        assert_eq!(loaded.error_code, None);
+
+        store.append(&job).unwrap();
+        let last_line = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .last()
+            .unwrap()
+            .to_owned();
+        assert!(!last_line.contains("error_code"));
     }
 }

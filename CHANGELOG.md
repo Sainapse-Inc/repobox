@@ -40,3 +40,17 @@ All notable changes to Repobox will be documented here.
   keyring and permission-restricted fallback storage.
 - Require confirmation before resuming mutating jobs and retain successful
   bindings when another database service fails.
+- Preserve bounded, credential-redacted `pg_dump` and `psql` diagnostics during
+  streamed imports; terminate descendant process groups and container-side dump
+  work on failure or cancellation; and clean up managed Docker `psql` fallback
+  containers after abnormal exits.
+- Make SIGINT and SIGTERM cleanup cooperative across imports, multi-service
+  mutations, Compose, and native runtimes; preserve foreground terminal behavior;
+  wait for newly started source databases; require `psql` 16 for system-root
+  trust or use the managed PostgreSQL 18 client; and clear stale errors from
+  succeeded durable jobs.
+- Checkpoint create and pull provider identity before mutation; reject
+  configuration drift before create, pull, or runtime access; derive deletion
+  only from durable ownership evidence; expose exact delete dry-run targets;
+  reconcile canceled create/pull resources; and stop partially started Compose
+  source services after startup failure.

@@ -27,6 +27,7 @@ directories = "6"
 hex = "0.4"
 json-patch = "4"
 keyring = { version = "3", features = ["apple-native", "crypto-rust", "linux-native-sync-persistent", "vendored", "windows-native"] }
+nix = { version = "0.30", features = ["process", "signal"] }
 ratatui = { version = "0.30", features = ["crossterm"] }
 regex = "1"
 reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
